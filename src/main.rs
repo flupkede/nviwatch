@@ -1,6 +1,7 @@
 mod app_state;
 mod error;
 mod gpu;
+mod gui;
 mod influx_local;
 mod keybinds;
 mod system_monitor;
@@ -58,6 +59,12 @@ fn main() -> Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("gui")
+                .long("gui")
+                .help("Launch the gpui window app instead of the terminal UI")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("cpu")
                 .short('c')
                 .long("cpu")
@@ -100,6 +107,10 @@ fn main() -> Result<()> {
         .unwrap_or(300);
 
     let nvml = Nvml::init()?;
+
+    if matches.get_flag("gui") {
+        return gui::run(nvml, watch_interval);
+    }
 
     // Create the runtime before raw/alternate screen so a failure never wedges the terminal.
     let runtime = tokio::runtime::Runtime::new()?;

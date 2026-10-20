@@ -16,6 +16,7 @@ categories = ["command-line-utilities", "visualization", "hardware-support"]
 [dependencies]
 clap = "4.6.5"
 crossterm = "0.29.0"
+gpui = "0.2.2"
 nvml = { version = "0.12.1", package = "nvml-wrapper" }
 prettytable-rs = "0.10.0"
 ratatui = "0.30.2"
