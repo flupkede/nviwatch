@@ -4,20 +4,25 @@
 //! window drains it on a timer loop. NVML stays off the UI executor so a slow
 //! driver call can never stall a frame.
 
+mod data;
+mod render;
+
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
 use gpui::{
-    KeyBinding, actions, div, prelude::*, px, rgb, size, App, Application, Bounds, Context,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    KeyBinding, actions, prelude::*, px, size, App, Application, Bounds, Context, TitlebarOptions,
+    WindowBounds, WindowOptions,
 };
 use nvml::Nvml;
 
 use crate::Result;
+use crate::utils::system::get_process_identity;
+use data::{GpuProc, MemSample, push_samples};
 
 actions!(nviwatch, [Quit]);
 
-/// One poll of one GPU. Process detail arrives in the data-layer stage.
+/// One poll of one GPU.
 #[derive(Clone, Debug)]
 pub(crate) struct GpuSnapshot {
     pub index: usize,
@@ -29,6 +34,31 @@ pub(crate) struct GpuSnapshot {
     pub power_usage: u32,
     pub power_limit: u32,
     pub clock_freq: u32,
+    pub processes: Vec<GpuProc>,
+    /// Sum of compute-process VRAM (the LLM segment of the memory graph).
+    pub compute_bytes: u64,
+    /// Sum of graphics-process VRAM (the video segment).
+    pub graphics_bytes: u64,
+}
+
+/// Merge compute+graphics NVML lists into typed rows, then resolve
+/// name/user per platform. Dead processes drop silently.
+fn enrich(
+    compute: Vec<nvml::struct_wrappers::device::ProcessInfo>,
+    graphics: Vec<nvml::struct_wrappers::device::ProcessInfo>,
+) -> Vec<GpuProc> {
+    data::classify_processes(&compute, &graphics)
+        .into_iter()
+        .filter_map(|(pid, used_gpu_memory, kind)| {
+            get_process_identity(pid).map(|(name, user)| GpuProc {
+                pid,
+                used_gpu_memory,
+                kind,
+                name,
+                user,
+            })
+        })
+        .collect()
 }
 
 fn poll_loop(nvml: Nvml, watch_ms: u64, tx: std::sync::mpsc::Sender<Vec<GpuSnapshot>>) {
@@ -53,6 +83,23 @@ fn poll_loop(nvml: Nvml, watch_ms: u64, tx: std::sync::mpsc::Sender<Vec<GpuSnaps
                 let clock_freq = device
                     .clock_info(nvml::enum_wrappers::device::Clock::Graphics)
                     .unwrap_or(0);
+                let compute = device.running_compute_processes().unwrap_or_default();
+                let graphics = device.running_graphics_processes().unwrap_or_default();
+                let compute_bytes = compute
+                    .iter()
+                    .filter_map(|p| match p.used_gpu_memory {
+                        nvml::enums::device::UsedGpuMemory::Used(b) => Some(b),
+                        _ => None,
+                    })
+                    .sum();
+                let graphics_bytes = graphics
+                    .iter()
+                    .filter_map(|p| match p.used_gpu_memory {
+                        nvml::enums::device::UsedGpuMemory::Used(b) => Some(b),
+                        _ => None,
+                    })
+                    .sum();
+                let processes = enrich(compute, graphics);
                 snapshots.push(GpuSnapshot {
                     index: index as usize,
                     name,
@@ -63,6 +110,9 @@ fn poll_loop(nvml: Nvml, watch_ms: u64, tx: std::sync::mpsc::Sender<Vec<GpuSnaps
                     power_usage,
                     power_limit,
                     clock_freq,
+                    processes,
+                    compute_bytes,
+                    graphics_bytes,
                 });
             }
         }
@@ -74,9 +124,13 @@ fn poll_loop(nvml: Nvml, watch_ms: u64, tx: std::sync::mpsc::Sender<Vec<GpuSnaps
     }
 }
 
-struct GpuMonitor {
+pub(crate) struct GpuMonitor {
     rx: Receiver<Vec<GpuSnapshot>>,
-    snapshots: Vec<GpuSnapshot>,
+    pub(crate) snapshots: Vec<GpuSnapshot>,
+    /// Per-GPU-index ring of memory samples for the stage-3 graph.
+    pub(crate) history: Vec<std::collections::VecDeque<MemSample>>,
+    /// Row index into the flattened, memory-sorted process list.
+    pub(crate) selected: usize,
 }
 
 impl GpuMonitor {
@@ -92,10 +146,12 @@ impl GpuMonitor {
                         let mut updated = false;
                         // Drain to the newest snapshot; skip stale ones.
                         while let Ok(snapshots) = view.rx.try_recv() {
+                            push_samples(&mut view.history, &snapshots);
                             view.snapshots = snapshots;
                             updated = true;
                         }
                         if updated {
+                            view.clamp_selection();
                             cx.notify();
                         }
                     })
@@ -107,71 +163,26 @@ impl GpuMonitor {
         })
         .detach();
     }
-}
 
-impl Render for GpuMonitor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let bg = rgb(0x0e1116);
-        let card_border = rgb(0x2a2f3a);
-        let text = rgb(0xd8dee9);
-        let dim = rgb(0x8b93a1);
+    /// Flattened process rows across GPUs, GPU-memory descending — the display
+    /// order for the list, selection and (stage 4) kill targeting.
+    pub(crate) fn process_rows(&self) -> Vec<(usize, &GpuProc)> {
+        let mut rows: Vec<(usize, &GpuProc)> = self
+            .snapshots
+            .iter()
+            .flat_map(|gpu| gpu.processes.iter().map(move |p| (gpu.index, p)))
+            .collect();
+        rows.sort_by_key(|(_, p)| std::cmp::Reverse(p.used_gpu_memory));
+        rows
+    }
 
-        let mut root = div()
-            .key_context("GpuMonitor")
-            .on_action(cx.listener(|_, _: &Quit, _, cx| cx.quit()))
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(bg)
-            .text_color(text)
-            .font_family("Segoe UI")
-            .p_4()
-            .gap_2();
-
-        if self.snapshots.is_empty() {
-            root = root.child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .text_color(dim)
-                    .child("Waiting for GPU data…"),
-            );
-            return root;
+    fn clamp_selection(&mut self) {
+        let total = self.process_rows().len();
+        if total == 0 {
+            self.selected = 0;
+        } else if self.selected >= total {
+            self.selected = total - 1;
         }
-
-        for gpu in &self.snapshots {
-            let header = format!(
-                "GPU {} — {}   {}°C   {}%   {}/{}   {}/{}W   {}MHz",
-                gpu.index,
-                gpu.name,
-                gpu.temperature,
-                gpu.utilization,
-                format_memory(gpu.memory_used),
-                format_memory(gpu.memory_total),
-                gpu.power_usage,
-                gpu.power_limit,
-                gpu.clock_freq,
-            );
-            root = root.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .border_1()
-                    .border_color(card_border)
-                    .rounded_md()
-                    .p_3()
-                    .child(div().text_lg().child(header))
-                    .child(
-                        div()
-                            .text_color(dim)
-                            .child("graphs and process list land in the next stages"),
-                    ),
-            );
-        }
-        root
     }
 }
 
@@ -181,25 +192,6 @@ fn format_memory(bytes: u64) -> String {
         format!("{:.1}GiB", mib as f64 / 1024.0)
     } else {
         format!("{mib}MiB")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_memory_mib_below_gib() {
-        assert_eq!(format_memory(0), "0MiB");
-        assert_eq!(format_memory(512 * 1_048_576), "512MiB");
-    }
-
-    #[test]
-    fn test_format_memory_gib_boundary() {
-        // 1 GiB exactly: switches to GiB display.
-        assert_eq!(format_memory(1_048_576 * 1024), "1.0GiB");
-        assert_eq!(format_memory(1_048_576 * 1024 - 1), "1023MiB");
-        assert_eq!(format_memory(24 * 1_048_576 * 1024), "24.0GiB");
     }
 }
 
@@ -226,6 +218,8 @@ pub(crate) fn run(nvml: Nvml, watch_ms: u64) -> Result<()> {
                     let mut view = GpuMonitor {
                         rx,
                         snapshots: Vec::new(),
+                        history: Vec::new(),
+                        selected: 0,
                     };
                     view.start_drain(cx);
                     view
@@ -235,4 +229,80 @@ pub(crate) fn run(nvml: Nvml, watch_ms: u64) -> Result<()> {
         .unwrap();
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data::ProcKind;
+
+    #[test]
+    fn test_format_memory_mib_below_gib() {
+        assert_eq!(format_memory(0), "0MiB");
+        assert_eq!(format_memory(512 * 1_048_576), "512MiB");
+    }
+
+    #[test]
+    fn test_format_memory_gib_boundary() {
+        // 1 GiB exactly: switches to GiB display.
+        assert_eq!(format_memory(1_048_576 * 1024), "1.0GiB");
+        assert_eq!(format_memory(1_048_576 * 1024 - 1), "1023MiB");
+        assert_eq!(format_memory(24 * 1_048_576 * 1024), "24.0GiB");
+    }
+
+    #[test]
+    fn test_process_rows_sorted_by_memory_desc() {
+        use data::GpuProc;
+        let mk = |pid: u32, mem: u64, kind: ProcKind| GpuProc {
+            pid,
+            used_gpu_memory: mem,
+            kind,
+            name: "x".into(),
+            user: "u".into(),
+        };
+        let mut view = GpuMonitor {
+            rx: channel::<Vec<GpuSnapshot>>().1,
+            snapshots: vec![
+                GpuSnapshot {
+                    index: 0,
+                    name: "G".into(),
+                    temperature: 0,
+                    utilization: 0,
+                    memory_used: 0,
+                    memory_total: 0,
+                    power_usage: 0,
+                    power_limit: 0,
+                    clock_freq: 0,
+                    processes: vec![mk(1, 100, ProcKind::Compute), mk(2, 900, ProcKind::Graphics)],
+                    compute_bytes: 100,
+                    graphics_bytes: 900,
+                },
+                GpuSnapshot {
+                    index: 1,
+                    name: "G2".into(),
+                    temperature: 0,
+                    utilization: 0,
+                    memory_used: 0,
+                    memory_total: 0,
+                    power_usage: 0,
+                    power_limit: 0,
+                    clock_freq: 0,
+                    processes: vec![mk(3, 500, ProcKind::Compute)],
+                    compute_bytes: 500,
+                    graphics_bytes: 0,
+                },
+            ],
+            history: Vec::new(),
+            selected: 0,
+        };
+        let rows = view.process_rows();
+        let pids: Vec<u32> = rows.iter().map(|(_, p)| p.pid).collect();
+        assert_eq!(pids, vec![2, 3, 1]); // 900, 500, 100
+        assert_eq!(rows[0].0, 0); // gpu index of pid 2
+        view.clamp_selection();
+        assert_eq!(view.selected, 0);
+        view.selected = 99;
+        view.clamp_selection();
+        assert_eq!(view.selected, 2);
+    }
 }

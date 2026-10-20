@@ -74,6 +74,29 @@ mod imp {
             sample,
         ))
     }
+    /// Executable name + username for a pid (GUI process list). argv[0]'s
+    /// file name survives spaced install paths; falls back to comm, then `[pid]`.
+    pub fn get_process_identity(pid: u32) -> Option<(String, String)> {
+        let process = Process::new(pid as i32).ok()?;
+        let uid = process.uid().ok()?;
+        // An unresolvable uid (rootless container mapping) still shows the
+        // row with "?" — only a dead pid drops it. Mirrors the Windows imp.
+        let username = User::from_uid(Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+            .unwrap_or_else(|| "?".to_string());
+        let name = process
+            .cmdline()
+            .ok()
+            .and_then(|cmd| cmd.into_iter().next())
+            .map(|argv0| argv0.rsplit('/').next().unwrap_or(&argv0).to_string())
+            .filter(|n| !n.is_empty())
+            .or_else(|| process.stat().ok().map(|stat| stat.comm))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("[{pid}]"));
+        Some((name, username))
+    }
 
     pub fn kill_selected_process(pid: u32, command: &str) -> Result<(), NviError> {
         match kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
@@ -253,6 +276,34 @@ mod imp {
                 },
                 sample,
             ))
+        })
+    }
+
+    /// Executable name + username for a pid, resolved in one probe pass.
+    /// `Process::name()` is already the basename, so spaced install paths
+    /// (`C:\Program Files\...`) need no argv parsing. GUI process list only.
+    pub fn get_process_identity(pid: u32) -> Option<(String, String)> {
+        with_probe(|probe| {
+            let sid = Pid::from_u32(pid);
+            probe.system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[sid]),
+                true,
+                process_refresh_kind(),
+            );
+            probe.ensure_users();
+            let process = probe.system.process(sid)?;
+            let username = process
+                .user_id()
+                .and_then(|uid| probe.users.get_user_by_id(uid))
+                .map(|u| u.name().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let name = process.name().to_string_lossy().into_owned();
+            let name = if name.is_empty() {
+                format!("[{pid}]")
+            } else {
+                name
+            };
+            Some((name, username))
         })
     }
 
