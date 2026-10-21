@@ -1,8 +1,8 @@
 //! Rendering for the gpui GPU monitor window.
 
 use gpui::{
-    Context, Div, PathBuilder, Pixels, Render, Rgba, Stateful, Window, canvas, div, point,
-    prelude::*, px, rgb,
+    Context, Div, PathBuilder, Pixels, Render, Rgba, SharedString, Stateful, Window, canvas, div,
+    point, prelude::*, px, rgb,
 };
 
 use super::GpuMonitor;
@@ -24,6 +24,9 @@ const SELECT_BG: u32 = 0x2d3b4e;
 const OTHER: u32 = 0x3a4150;
 const UTIL: u32 = 0xc792ea;
 const POWER: u32 = 0xe5c07b;
+/// Footer kill feedback: success / failure.
+const OK: u32 = 0x98c379;
+const ERR: u32 = 0xe06c75;
 
 fn kind_label(kind: ProcKind) -> &'static str {
     match kind {
@@ -44,6 +47,9 @@ impl Render for GpuMonitor {
         let mut root = div()
             .key_context("GpuMonitor")
             .on_action(cx.listener(|_, _: &super::Quit, _, cx| cx.quit()))
+            .on_action(cx.listener(GpuMonitor::select_up))
+            .on_action(cx.listener(GpuMonitor::select_down))
+            .on_action(cx.listener(GpuMonitor::kill_selected))
             .flex()
             .flex_col()
             .size_full()
@@ -84,14 +90,19 @@ impl Render for GpuMonitor {
             self.sort_asc,
         ));
 
-        root = root.child(
-            div()
-                .flex()
-                .justify_between()
-                .text_color(rgb(DIM))
-                .child("up/down select · x kill · q quit")
-                .child(format!("{} processes", rows.len())),
-        );
+        let mut footer = div()
+            .flex()
+            .justify_between()
+            .text_color(rgb(DIM))
+            .child("up/down select · x kill · q quit");
+        if let Some((message, ok)) = &self.last_message {
+            footer = footer.child(
+                div()
+                    .text_color(rgb(if *ok { OK } else { ERR }))
+                    .child(message.clone()),
+            );
+        }
+        root = root.child(footer.child(format!("{} processes", rows.len())));
         root
     }
 }
@@ -366,6 +377,12 @@ fn render_process_list(
             format_memory(process.used_gpu_memory)
         };
         let row = div()
+            .id(SharedString::from(format!("proc-row-{index}")))
+            .on_click(cx.listener(move |view, _, _, cx| {
+                view.selected = index;
+                cx.notify();
+            }))
+            .cursor_pointer()
             .flex()
             .gap_3()
             .py_0p5()

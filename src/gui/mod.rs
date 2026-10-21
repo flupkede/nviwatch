@@ -22,7 +22,7 @@ use crate::Result;
 use crate::utils::system::get_process_identity;
 use data::{GpuProc, MemSample, ProcKind, SortKey, push_samples};
 
-actions!(nviwatch, [Quit]);
+actions!(nviwatch, [Quit, SelectUp, SelectDown, KillSelected]);
 
 /// One poll of one GPU.
 #[derive(Clone, Debug)]
@@ -51,7 +51,18 @@ fn enrich(
     compute: Vec<nvml::struct_wrappers::device::ProcessInfo>,
     graphics: Vec<nvml::struct_wrappers::device::ProcessInfo>,
 ) -> Vec<GpuProc> {
-    let mut pids: Vec<u32> = Vec::new();
+    let pids = union_pids(&compute, &graphics);
+    let vram = vram::process_vram_bytes(&pids);
+    enrich_with(&vram, compute, graphics)
+}
+
+/// The injectable seam behind `enrich`: `vram` stands in for the D3DKMT map
+/// so the fallback chain is testable without hardware.
+fn enrich_with(
+    vram: &std::collections::HashMap<u32, u64>,
+    compute: Vec<nvml::struct_wrappers::device::ProcessInfo>,
+    graphics: Vec<nvml::struct_wrappers::device::ProcessInfo>,
+) -> Vec<GpuProc> {
     let mut nvml_mem: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     for info in compute.iter().chain(graphics.iter()) {
         let bytes = match info.used_gpu_memory {
@@ -62,12 +73,9 @@ fn enrich(
             .entry(info.pid)
             .and_modify(|existing| *existing = (*existing).max(bytes))
             .or_insert(bytes);
-        if !pids.contains(&info.pid) {
-            pids.push(info.pid);
-        }
     }
-    let vram = vram::process_vram_bytes(&pids);
-    pids.into_iter()
+    union_pids(&compute, &graphics)
+        .into_iter()
         .filter_map(|pid| {
             let (name, user) = get_process_identity(pid)?;
             Some(GpuProc {
@@ -83,6 +91,20 @@ fn enrich(
             })
         })
         .collect()
+}
+
+/// Pids from both NVML lists, deduped, first-seen order.
+fn union_pids(
+    compute: &[nvml::struct_wrappers::device::ProcessInfo],
+    graphics: &[nvml::struct_wrappers::device::ProcessInfo],
+) -> Vec<u32> {
+    let mut pids: Vec<u32> = Vec::new();
+    for info in compute.iter().chain(graphics.iter()) {
+        if !pids.contains(&info.pid) {
+            pids.push(info.pid);
+        }
+    }
+    pids
 }
 
 fn poll_loop(nvml: Nvml, watch_ms: u64, tx: std::sync::mpsc::Sender<Vec<GpuSnapshot>>) {
@@ -154,6 +176,8 @@ pub(crate) struct GpuMonitor {
     /// Current column sort of the process list (clickable headers).
     pub(crate) sort_key: SortKey,
     pub(crate) sort_asc: bool,
+    /// Last kill outcome for the footer: (text, ok).
+    pub(crate) last_message: Option<(String, bool)>,
 }
 
 impl GpuMonitor {
@@ -228,6 +252,68 @@ impl GpuMonitor {
             self.selected = total - 1;
         }
     }
+
+    /// Move the selection by `step` rows, clamped to the list bounds.
+    fn step_selection(&mut self, step: isize) {
+        let total = self.process_rows().len() as isize;
+        if total == 0 {
+            self.selected = 0;
+            return;
+        }
+        let next = self.selected as isize + step;
+        self.selected = next.clamp(0, total - 1) as usize;
+    }
+
+    pub(crate) fn select_up(&mut self, _: &SelectUp, _: &mut gpui::Window, cx: &mut Context<Self>) {
+        self.step_selection(-1);
+        cx.notify();
+    }
+
+    pub(crate) fn select_down(
+        &mut self,
+        _: &SelectDown,
+        _: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_selection(1);
+        cx.notify();
+    }
+
+    /// The process the kill action targets: the selected row in display order.
+    fn kill_target(&self) -> Option<(u32, String)> {
+        self.process_rows()
+            .get(self.selected)
+            .map(|(_, p)| (p.pid, p.name.clone()))
+    }
+
+    pub(crate) fn kill_selected(
+        &mut self,
+        _: &KillSelected,
+        _: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pid, name)) = self.kill_target() else {
+            return;
+        };
+        self.last_message = Some(kill_message(
+            crate::utils::system::kill_selected_process(pid, &name),
+            pid,
+            &name,
+        ));
+        cx.notify();
+    }
+}
+
+/// Footer text for a kill attempt: (message, ok).
+fn kill_message<E: std::fmt::Display>(
+    result: std::result::Result<(), E>,
+    pid: u32,
+    name: &str,
+) -> (String, bool) {
+    match result {
+        Ok(()) => (format!("killed {pid} ({name})"), true),
+        Err(e) => (format!("kill {pid} failed: {e}"), false),
+    }
 }
 
 fn format_memory(bytes: u64) -> String {
@@ -247,7 +333,12 @@ pub(crate) fn run(nvml: Nvml, watch_ms: u64) -> Result<()> {
 
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1100.), px(780.)), cx);
-        cx.bind_keys([KeyBinding::new("q", Quit, Some("GpuMonitor"))]);
+        cx.bind_keys([
+            KeyBinding::new("q", Quit, Some("GpuMonitor")),
+            KeyBinding::new("up", SelectUp, Some("GpuMonitor")),
+            KeyBinding::new("down", SelectDown, Some("GpuMonitor")),
+            KeyBinding::new("x", KillSelected, Some("GpuMonitor")),
+        ]);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -266,6 +357,7 @@ pub(crate) fn run(nvml: Nvml, watch_ms: u64) -> Result<()> {
                         selected: 0,
                         sort_key: SortKey::Memory,
                         sort_asc: false,
+                        last_message: None,
                     };
                     view.start_drain(cx);
                     view
@@ -342,6 +434,7 @@ mod tests {
             selected: 0,
             sort_key: SortKey::Memory,
             sort_asc: false,
+            last_message: None,
         };
         let rows = view.process_rows();
         let pids: Vec<u32> = rows.iter().map(|(_, p)| p.pid).collect();
@@ -384,6 +477,7 @@ mod tests {
             selected: 0,
             sort_key: SortKey::Memory,
             sort_asc: false,
+            last_message: None,
         };
         // New column starts ascending (memory is the descending exception).
         view.toggle_sort(SortKey::Name);
@@ -406,5 +500,110 @@ mod tests {
         // Switching to memory starts descending.
         view.toggle_sort(SortKey::Memory);
         assert!(!view.sort_asc);
+    }
+
+    // --- stage 4: enrich seam, selection, kill target ---
+
+    fn proc_info(pid: u32, bytes: u64) -> nvml::struct_wrappers::device::ProcessInfo {
+        nvml::struct_wrappers::device::ProcessInfo {
+            pid,
+            used_gpu_memory: nvml::enums::device::UsedGpuMemory::Used(bytes),
+            gpu_instance_id: None,
+            compute_instance_id: None,
+        }
+    }
+
+    fn view_with_pids(pids: &[u32]) -> GpuMonitor {
+        let processes: Vec<GpuProc> = pids
+            .iter()
+            .map(|&pid| GpuProc {
+                pid,
+                used_gpu_memory: 0,
+                kind: ProcKind::Graphics,
+                name: format!("p{pid}"),
+                user: "u".into(),
+            })
+            .collect();
+        GpuMonitor {
+            rx: channel::<Vec<GpuSnapshot>>().1,
+            snapshots: vec![GpuSnapshot {
+                index: 0,
+                name: "G".into(),
+                temperature: 0,
+                utilization: 0,
+                memory_used: 0,
+                memory_total: 0,
+                power_usage: 0,
+                power_limit: 0,
+                clock_freq: 0,
+                processes,
+                compute_bytes: 0,
+                graphics_bytes: 0,
+            }],
+            history: Vec::new(),
+            selected: 0,
+            sort_key: SortKey::Pid,
+            sort_asc: true,
+            last_message: None,
+        }
+    }
+
+    /// The live test process resolves on every platform, so `enrich_with` is
+    /// drivable without hardware.
+    #[test]
+    fn test_enrich_with_empty_vram_falls_back_to_nvml() {
+        let pid = std::process::id();
+        let rows = enrich_with(
+            &std::collections::HashMap::new(),
+            vec![proc_info(pid, 1234)],
+            Vec::new(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pid, pid);
+        assert_eq!(rows[0].used_gpu_memory, 1234);
+    }
+
+    #[test]
+    fn test_enrich_with_vram_map_wins_over_nvml() {
+        let pid = std::process::id();
+        let vram = std::collections::HashMap::from([(pid, 9999u64)]);
+        let rows = enrich_with(&vram, vec![proc_info(pid, 1234)], Vec::new());
+        assert_eq!(rows[0].used_gpu_memory, 9999);
+    }
+
+    #[test]
+    fn test_step_selection_clamps() {
+        let mut view = view_with_pids(&[1, 2, 3]);
+        view.step_selection(1);
+        assert_eq!(view.selected, 1);
+        view.step_selection(10);
+        assert_eq!(view.selected, 2);
+        view.step_selection(-10);
+        assert_eq!(view.selected, 0);
+        view.step_selection(-1);
+        assert_eq!(view.selected, 0);
+    }
+
+    #[test]
+    fn test_kill_target_follows_selection() {
+        let mut view = view_with_pids(&[11, 22, 33]);
+        assert_eq!(view.kill_target().unwrap().0, 11);
+        view.selected = 2;
+        let (pid, name) = view.kill_target().unwrap();
+        assert_eq!(pid, 33);
+        assert_eq!(name, "p33");
+        // Empty list: no target, kill is a no-op.
+        assert!(view_with_pids(&[]).kill_target().is_none());
+    }
+
+    #[test]
+    fn test_kill_message() {
+        let (msg, ok) = kill_message(Ok::<(), std::io::Error>(()), 7, "ollama");
+        assert!(ok);
+        assert_eq!(msg, "killed 7 (ollama)");
+        let (msg, ok) =
+            kill_message(Err::<(), _>(std::io::Error::other("denied")), 7, "ollama");
+        assert!(!ok);
+        assert_eq!(msg, "kill 7 failed: denied");
     }
 }
