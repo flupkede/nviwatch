@@ -13,8 +13,8 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
 use gpui::{
-    KeyBinding, actions, prelude::*, px, size, App, Application, Bounds, Context, TitlebarOptions,
-    WindowBounds, WindowOptions,
+    App, Application, Bounds, Context, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
+    actions, prelude::*, px, size,
 };
 use nvml::Nvml;
 
@@ -411,7 +411,10 @@ mod tests {
                     power_usage: 0,
                     power_limit: 0,
                     clock_freq: 0,
-                    processes: vec![mk(1, 100, ProcKind::Compute), mk(2, 900, ProcKind::Graphics)],
+                    processes: vec![
+                        mk(1, 100, ProcKind::Compute),
+                        mk(2, 900, ProcKind::Graphics),
+                    ],
                     compute_bytes: 100,
                     graphics_bytes: 900,
                 },
@@ -601,8 +604,7 @@ mod tests {
         let (msg, ok) = kill_message(Ok::<(), std::io::Error>(()), 7, "ollama");
         assert!(ok);
         assert_eq!(msg, "killed 7 (ollama)");
-        let (msg, ok) =
-            kill_message(Err::<(), _>(std::io::Error::other("denied")), 7, "ollama");
+        let (msg, ok) = kill_message(Err::<(), _>(std::io::Error::other("denied")), 7, "ollama");
         assert!(!ok);
         assert_eq!(msg, "kill 7 failed: denied");
     }

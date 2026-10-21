@@ -73,7 +73,10 @@ pub(crate) struct MemSample {
 pub(crate) const HISTORY_CAP: usize = 240;
 
 /// Append one sample per GPU index, dropping the oldest beyond `HISTORY_CAP`.
-pub(crate) fn push_samples(history: &mut Vec<VecDeque<MemSample>>, snapshots: &[super::GpuSnapshot]) {
+pub(crate) fn push_samples(
+    history: &mut Vec<VecDeque<MemSample>>,
+    snapshots: &[super::GpuSnapshot],
+) {
     for gpu in snapshots {
         let other = gpu
             .memory_used
@@ -138,7 +141,7 @@ mod tests {
             graphics_bytes: 400,
         };
         for _ in 0..(HISTORY_CAP + 5) {
-            push_samples(&mut history, &[snap.clone()]);
+            push_samples(&mut history, std::slice::from_ref(&snap));
         }
         assert_eq!(history[0].len(), HISTORY_CAP);
         let last = history[0].back().unwrap();

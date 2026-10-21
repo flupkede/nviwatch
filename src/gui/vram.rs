@@ -11,14 +11,13 @@
 #[cfg(windows)]
 pub(crate) fn process_vram_bytes(pids: &[u32]) -> std::collections::HashMap<u32, u64> {
     use windows::Wdk::Graphics::Direct3D::{
-        D3DKMT_QUERYSTATISTICS, D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP,
-        D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL, D3DKMT_ADAPTERINFO, D3DKMT_CLOSEADAPTER,
-        D3DKMT_ENUMADAPTERS2, D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryStatistics,
+        D3DKMT_ADAPTERINFO, D3DKMT_CLOSEADAPTER, D3DKMT_ENUMADAPTERS2,
+        D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL, D3DKMT_QUERYSTATISTICS, D3DKMT_QUERYSTATISTICS_0,
+        D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP, D3DKMTCloseAdapter, D3DKMTEnumAdapters2,
+        D3DKMTQueryStatistics,
     };
     use windows::Win32::Foundation::{CloseHandle, NTSTATUS};
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     let succeeded = |status: NTSTATUS| status.0 >= 0;
     let mut map = std::collections::HashMap::new();
@@ -32,7 +31,8 @@ pub(crate) fn process_vram_bytes(pids: &[u32]) -> std::collections::HashMap<u32,
     if !succeeded(unsafe { D3DKMTEnumAdapters2(&mut listed) }) || listed.NumAdapters == 0 {
         return map;
     }
-    let mut adapters: Vec<D3DKMT_ADAPTERINFO> = vec![D3DKMT_ADAPTERINFO::default(); listed.NumAdapters as usize];
+    let mut adapters: Vec<D3DKMT_ADAPTERINFO> =
+        vec![D3DKMT_ADAPTERINFO::default(); listed.NumAdapters as usize];
     listed.pAdapters = adapters.as_mut_ptr();
     if !succeeded(unsafe { D3DKMTEnumAdapters2(&mut listed) }) {
         return map;
@@ -45,11 +45,15 @@ pub(crate) fn process_vram_bytes(pids: &[u32]) -> std::collections::HashMap<u32,
         };
         let mut best: u64 = 0;
         for adapter in &adapters {
-            let mut query = D3DKMT_QUERYSTATISTICS::default();
-            query.Type = D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP;
-            query.AdapterLuid = adapter.AdapterLuid;
-            query.hProcess = handle;
-            query.Anonymous.QueryProcessSegmentGroup = D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL;
+            let query = D3DKMT_QUERYSTATISTICS {
+                Type: D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP,
+                AdapterLuid: adapter.AdapterLuid,
+                hProcess: handle,
+                Anonymous: D3DKMT_QUERYSTATISTICS_0 {
+                    QueryProcessSegmentGroup: D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL,
+                },
+                ..Default::default()
+            };
             if succeeded(unsafe { D3DKMTQueryStatistics(&query) }) {
                 let usage = unsafe { query.QueryResult.ProcessSegmentGroupInformation.Usage };
                 best = best.max(usage);

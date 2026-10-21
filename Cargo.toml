@@ -2,27 +2,21 @@
 name = "nviwatch"
 version = "0.2.4"
 edition = "2024"
-description = "A blazingly fast Rust-based TUI for managing and monitoring NVIDIA GPU processes"
+description = "A blazingly fast Rust-based GUI for managing and monitoring NVIDIA GPU processes"
 license = "GPL-3.0"
 authors = ["Manpreet Singh Minhas <msminhas@uwaterloo.ca>"]
 repository = "https://github.com/msminhas93/nviwatch"
 homepage = "https://github.com/msminhas93/nviwatch"
 documentation = "https://github.com/msminhas93/nviwatch#readme"
 readme = "README.md"
-keywords = ["nvidia", "gpu", "monitoring", "tui", "system-monitor"]
+keywords = ["nvidia", "gpu", "monitoring", "gui", "system-monitor"]
 categories = ["command-line-utilities", "visualization", "hardware-support"]
 
 
 [dependencies]
 clap = "4.6.5"
-crossterm = "0.29.0"
 gpui = "0.2.2"
 nvml = { version = "0.12.1", package = "nvml-wrapper" }
-prettytable-rs = "0.10.0"
-ratatui = "0.30.2"
-textwrap = "0.16.2"
-influxdb = { version = "0.8.0", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["full"] }
 
 # Linux-only: /proc parsing (procfs) and POSIX wrappers (nix).
 [target.'cfg(unix)'.dependencies]

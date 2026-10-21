@@ -130,7 +130,11 @@ fn render_gpu_card(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl Into
                 )
                 .child(div().text_color(rgb(DIM)).child(format!(
                     "{}°C   {}%   {}/{}W   {}MHz",
-                    gpu.temperature, gpu.utilization, gpu.power_usage, gpu.power_limit, gpu.clock_freq,
+                    gpu.temperature,
+                    gpu.utilization,
+                    gpu.power_usage,
+                    gpu.power_limit,
+                    gpu.clock_freq,
                 ))),
         )
         .child(render_memory_graph(gpu, samples))
@@ -162,16 +166,15 @@ fn render_memory_graph(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
                 )),
         )
         .child(
-            div()
-                .h(px(150.))
-                .w_full()
-                .child(canvas(
+            div().h(px(150.)).w_full().child(
+                canvas(
                     |_, _, _| {},
                     move |bounds, _, window, _| {
                         paint_stacked(bounds, &samples, window);
                     },
                 )
-                .size_full()),
+                .size_full(),
+            ),
         )
         .child(
             div()
@@ -255,16 +258,15 @@ fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
                         .child(format!("{}%", gpu.utilization)),
                 )
                 .child(
-                    div()
-                        .h(px(56.))
-                        .w_full()
-                        .child(canvas(
+                    div().h(px(56.)).w_full().child(
+                        canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
                                 paint_area(bounds, &util, 100.0, rgb(UTIL), window);
                             },
                         )
-                        .size_full()),
+                        .size_full(),
+                    ),
                 )
                 .child(div().text_xs().text_color(rgb(DIM)).child("utilization")),
         )
@@ -276,16 +278,15 @@ fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
                 .gap_0p5()
                 .child(div().text_color(rgb(TEXT)).child(power_label))
                 .child(
-                    div()
-                        .h(px(56.))
-                        .w_full()
-                        .child(canvas(
+                    div().h(px(56.)).w_full().child(
+                        canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
                                 paint_area(bounds, &power, power_max, rgb(POWER), window);
                             },
                         )
-                        .size_full()),
+                        .size_full(),
+                    ),
                 )
                 .child(
                     div()
@@ -359,15 +360,51 @@ fn render_process_list(
             .border_b_1()
             .border_color(rgb(BORDER))
             .pb_1()
-            .child(sort_header(cx, "hdr-pid", "PID", SortKey::Pid, sort_key, sort_asc, Some(px(70.))))
             .child(sort_header(
-                cx, "hdr-mem", "GPU-Mem", SortKey::Memory, sort_key, sort_asc, Some(px(80.)),
+                cx,
+                "hdr-pid",
+                "PID",
+                SortKey::Pid,
+                sort_key,
+                sort_asc,
+                Some(px(70.)),
             ))
-            .child(sort_header(cx, "hdr-kind", "Type", SortKey::Kind, sort_key, sort_asc, Some(px(64.))))
             .child(sort_header(
-                cx, "hdr-name", "Name", SortKey::Name, sort_key, sort_asc, Some(px(180.)),
+                cx,
+                "hdr-mem",
+                "GPU-Mem",
+                SortKey::Memory,
+                sort_key,
+                sort_asc,
+                Some(px(80.)),
             ))
-            .child(sort_header(cx, "hdr-user", "User", SortKey::User, sort_key, sort_asc, None)),
+            .child(sort_header(
+                cx,
+                "hdr-kind",
+                "Type",
+                SortKey::Kind,
+                sort_key,
+                sort_asc,
+                Some(px(64.)),
+            ))
+            .child(sort_header(
+                cx,
+                "hdr-name",
+                "Name",
+                SortKey::Name,
+                sort_key,
+                sort_asc,
+                Some(px(180.)),
+            ))
+            .child(sort_header(
+                cx,
+                "hdr-user",
+                "User",
+                SortKey::User,
+                sort_key,
+                sort_asc,
+                None,
+            )),
     );
 
     for (index, (gpu_index, process)) in rows.iter().enumerate() {
@@ -395,7 +432,12 @@ fn render_process_list(
                     .text_color(kind_color(process.kind))
                     .child(kind_label(process.kind)),
             )
-            .child(div().w(px(180.)).text_ellipsis().child(process.name.clone()))
+            .child(
+                div()
+                    .w(px(180.))
+                    .text_ellipsis()
+                    .child(process.name.clone()),
+            )
             .child(
                 div()
                     .text_color(rgb(DIM))
