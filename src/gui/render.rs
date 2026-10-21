@@ -85,7 +85,7 @@ impl Render for GpuMonitor {
         root = root.child(render_process_list(
             cx,
             &rows,
-            self.selected,
+            self.selected_row_index(),
             self.sort_key,
             self.sort_asc,
         ));
@@ -145,6 +145,8 @@ fn render_gpu_card(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl Into
 /// label, scale and legend.
 fn render_memory_graph(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl IntoElement {
     let samples = samples.to_vec();
+    // Same y-scale rule as graph.rs stacked_geometry — keep the two in sync
+    // or the axis label stops matching the drawn polygons.
     let y_max_label = samples
         .iter()
         .map(|s| s.mem_total.max(s.compute + s.graphics + s.other))
@@ -325,7 +327,7 @@ fn paint_area(
 fn render_process_list(
     cx: &mut Context<GpuMonitor>,
     rows: &[(usize, &super::GpuProc)],
-    selected: usize,
+    selected: Option<usize>,
     sort_key: SortKey,
     sort_asc: bool,
 ) -> impl IntoElement {
@@ -413,17 +415,20 @@ fn render_process_list(
         } else {
             format_memory(process.used_gpu_memory)
         };
+        // Selection is keyed by (gpu, pid), not row: the row a process
+        // occupies can change between polls.
+        let (row_gpu, row_pid) = (*gpu_index, process.pid);
         let row = div()
             .id(SharedString::from(format!("proc-row-{index}")))
             .on_click(cx.listener(move |view, _, _, cx| {
-                view.selected = index;
+                view.selected = Some((row_gpu, row_pid));
                 cx.notify();
             }))
             .cursor_pointer()
             .flex()
             .gap_3()
             .py_0p5()
-            .when(index == selected, |el| el.bg(rgb(SELECT_BG)))
+            .when(selected == Some(index), |el| el.bg(rgb(SELECT_BG)))
             .child(div().w(px(70.)).child(process.pid.to_string()))
             .child(div().w(px(80.)).child(mem))
             .child(

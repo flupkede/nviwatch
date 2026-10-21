@@ -17,6 +17,9 @@ use gpui::{
     actions, prelude::*, px, size,
 };
 use nvml::Nvml;
+use nvml::device::Device;
+use nvml::enum_wrappers::device::{Clock, TemperatureSensor};
+use nvml::struct_wrappers::device::ProcessInfo;
 
 use crate::Result;
 use crate::utils::system::get_process_identity;
@@ -46,22 +49,12 @@ pub(crate) struct GpuSnapshot {
 /// Merge the NVML process lists into typed rows: name/user resolved per
 /// platform, kind decided by name, VRAM from D3DKMT with the NVML figure as
 /// fallback (D3DKMT is Windows-only; NVML reports "NA" there on WDDM). Dead
-/// processes drop silently.
-fn enrich(
-    compute: Vec<nvml::struct_wrappers::device::ProcessInfo>,
-    graphics: Vec<nvml::struct_wrappers::device::ProcessInfo>,
-) -> Vec<GpuProc> {
-    let pids = union_pids(&compute, &graphics);
-    let vram = vram::process_vram_bytes(&pids);
-    enrich_with(&vram, compute, graphics)
-}
-
-/// The injectable seam behind `enrich`: `vram` stands in for the D3DKMT map
-/// so the fallback chain is testable without hardware.
+/// processes drop silently. `vram` is injected so the fallback chain is
+/// testable without hardware.
 fn enrich_with(
     vram: &std::collections::HashMap<u32, u64>,
-    compute: Vec<nvml::struct_wrappers::device::ProcessInfo>,
-    graphics: Vec<nvml::struct_wrappers::device::ProcessInfo>,
+    compute: Vec<ProcessInfo>,
+    graphics: Vec<ProcessInfo>,
 ) -> Vec<GpuProc> {
     let mut nvml_mem: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     for info in compute.iter().chain(graphics.iter()) {
@@ -94,10 +87,7 @@ fn enrich_with(
 }
 
 /// Pids from both NVML lists, deduped, first-seen order.
-fn union_pids(
-    compute: &[nvml::struct_wrappers::device::ProcessInfo],
-    graphics: &[nvml::struct_wrappers::device::ProcessInfo],
-) -> Vec<u32> {
+fn union_pids(compute: &[ProcessInfo], graphics: &[ProcessInfo]) -> Vec<u32> {
     let mut pids: Vec<u32> = Vec::new();
     for info in compute.iter().chain(graphics.iter()) {
         if !pids.contains(&info.pid) {
@@ -105,6 +95,103 @@ fn union_pids(
         }
     }
     pids
+}
+
+/// The NVML reads one snapshot needs, collapsed to `Option` — the degrade
+/// mapping only distinguishes success from failure. Behind a trait so the
+/// per-field fallback is unit-testable without a GPU (mirrors `enrich_with`).
+trait DeviceSource {
+    fn name(&self) -> Option<String>;
+    fn temperature(&self) -> Option<u32>;
+    fn utilization(&self) -> Option<u32>;
+    fn memory(&self) -> Option<(u64, u64)>;
+    fn power_usage(&self) -> Option<u32>;
+    fn power_limit(&self) -> Option<u32>;
+    fn clock(&self) -> Option<u32>;
+    fn running_compute_processes(&self) -> Option<Vec<ProcessInfo>>;
+    fn running_graphics_processes(&self) -> Option<Vec<ProcessInfo>>;
+}
+
+impl DeviceSource for Device<'_> {
+    fn name(&self) -> Option<String> {
+        self.name().ok()
+    }
+
+    fn temperature(&self) -> Option<u32> {
+        self.temperature(TemperatureSensor::Gpu).ok()
+    }
+
+    fn utilization(&self) -> Option<u32> {
+        self.utilization_rates().ok().map(|u| u.gpu)
+    }
+
+    fn memory(&self) -> Option<(u64, u64)> {
+        self.memory_info().ok().map(|m| (m.used, m.total))
+    }
+
+    fn power_usage(&self) -> Option<u32> {
+        self.power_usage().ok()
+    }
+
+    fn power_limit(&self) -> Option<u32> {
+        self.enforced_power_limit().ok()
+    }
+
+    fn clock(&self) -> Option<u32> {
+        self.clock_info(Clock::Graphics).ok()
+    }
+
+    fn running_compute_processes(&self) -> Option<Vec<ProcessInfo>> {
+        self.running_compute_processes().ok()
+    }
+
+    fn running_graphics_processes(&self) -> Option<Vec<ProcessInfo>> {
+        self.running_graphics_processes().ok()
+    }
+}
+
+/// Assemble one GPU's snapshot, degrading every failed read to its neutral
+/// value — never panics (pinned by the fake-source tests below).
+fn snapshot_for(
+    src: &impl DeviceSource,
+    index: usize,
+    vram_fn: &dyn Fn(&[u32]) -> std::collections::HashMap<u32, u64>,
+) -> GpuSnapshot {
+    let name = src.name().unwrap_or_else(|| "GPU".to_string());
+    let temperature = src.temperature().unwrap_or(0);
+    let utilization = src.utilization().unwrap_or(0);
+    let (memory_used, memory_total) = src.memory().unwrap_or((0, 0));
+    let power_usage = src.power_usage().unwrap_or(0) / 1000;
+    let power_limit = src.power_limit().unwrap_or(0) / 1000;
+    let clock_freq = src.clock().unwrap_or(0);
+    let compute = src.running_compute_processes().unwrap_or_default();
+    let graphics = src.running_graphics_processes().unwrap_or_default();
+    let pids = union_pids(&compute, &graphics);
+    let processes = enrich_with(&vram_fn(&pids), compute, graphics);
+    let compute_bytes = processes
+        .iter()
+        .filter(|p| p.kind == ProcKind::Compute)
+        .map(|p| p.used_gpu_memory)
+        .sum();
+    let graphics_bytes = processes
+        .iter()
+        .filter(|p| p.kind == ProcKind::Graphics)
+        .map(|p| p.used_gpu_memory)
+        .sum();
+    GpuSnapshot {
+        index,
+        name,
+        temperature,
+        utilization,
+        memory_used,
+        memory_total,
+        power_usage,
+        power_limit,
+        clock_freq,
+        processes,
+        compute_bytes,
+        graphics_bytes,
+    }
 }
 
 fn poll_loop(nvml: Nvml, watch_ms: u64, tx: std::sync::mpsc::Sender<Vec<GpuSnapshot>>) {
@@ -115,47 +202,11 @@ fn poll_loop(nvml: Nvml, watch_ms: u64, tx: std::sync::mpsc::Sender<Vec<GpuSnaps
                 let Ok(device) = nvml.device_by_index(index) else {
                     continue;
                 };
-                let name = device.name().unwrap_or_else(|_| "GPU".to_string());
-                let temperature = device
-                    .temperature(nvml::enum_wrappers::device::TemperatureSensor::Gpu)
-                    .unwrap_or(0);
-                let utilization = device.utilization_rates().map(|u| u.gpu).unwrap_or(0);
-                let (memory_used, memory_total) = device
-                    .memory_info()
-                    .map(|m| (m.used, m.total))
-                    .unwrap_or((0, 0));
-                let power_usage = device.power_usage().unwrap_or(0) / 1000;
-                let power_limit = device.enforced_power_limit().unwrap_or(0) / 1000;
-                let clock_freq = device
-                    .clock_info(nvml::enum_wrappers::device::Clock::Graphics)
-                    .unwrap_or(0);
-                let compute = device.running_compute_processes().unwrap_or_default();
-                let graphics = device.running_graphics_processes().unwrap_or_default();
-                let processes = enrich(compute, graphics);
-                let compute_bytes = processes
-                    .iter()
-                    .filter(|p| p.kind == ProcKind::Compute)
-                    .map(|p| p.used_gpu_memory)
-                    .sum();
-                let graphics_bytes = processes
-                    .iter()
-                    .filter(|p| p.kind == ProcKind::Graphics)
-                    .map(|p| p.used_gpu_memory)
-                    .sum();
-                snapshots.push(GpuSnapshot {
-                    index: index as usize,
-                    name,
-                    temperature,
-                    utilization,
-                    memory_used,
-                    memory_total,
-                    power_usage,
-                    power_limit,
-                    clock_freq,
-                    processes,
-                    compute_bytes,
-                    graphics_bytes,
-                });
+                snapshots.push(snapshot_for(
+                    &device,
+                    index as usize,
+                    &vram::process_vram_bytes,
+                ));
             }
         }
         // Receiver gone means the window closed; end the thread.
@@ -171,8 +222,10 @@ pub(crate) struct GpuMonitor {
     pub(crate) snapshots: Vec<GpuSnapshot>,
     /// Per-GPU-index ring of memory samples for the stage-3 graph.
     pub(crate) history: Vec<std::collections::VecDeque<MemSample>>,
-    /// Row index into the flattened, sorted process list.
-    pub(crate) selected: usize,
+    /// Selection keyed by (gpu index, pid) so it follows the process across
+    /// re-sorts and polls, instead of pointing at a display row another
+    /// process can occupy between polls.
+    pub(crate) selected: Option<(usize, u32)>,
     /// Current column sort of the process list (clickable headers).
     pub(crate) sort_key: SortKey,
     pub(crate) sort_asc: bool,
@@ -198,7 +251,7 @@ impl GpuMonitor {
                             updated = true;
                         }
                         if updated {
-                            view.clamp_selection();
+                            view.revalidate_selection();
                             cx.notify();
                         }
                     })
@@ -244,24 +297,36 @@ impl GpuMonitor {
         }
     }
 
-    fn clamp_selection(&mut self) {
-        let total = self.process_rows().len();
-        if total == 0 {
-            self.selected = 0;
-        } else if self.selected >= total {
-            self.selected = total - 1;
+    /// Display index of the selected process, if it is still listed.
+    pub(crate) fn selected_row_index(&self) -> Option<usize> {
+        let sel = self.selected?;
+        self.process_rows()
+            .iter()
+            .position(|(gpu, p)| *gpu == sel.0 && p.pid == sel.1)
+    }
+
+    /// Drop a selection whose process is gone (died, or left the GPU).
+    fn revalidate_selection(&mut self) {
+        if self.selected.is_some() && self.selected_row_index().is_none() {
+            self.selected = None;
         }
     }
 
-    /// Move the selection by `step` rows, clamped to the list bounds.
+    /// Move the selection by `step` rows, clamped to the list bounds. From no
+    /// selection, down enters at the first row and up at the last.
     fn step_selection(&mut self, step: isize) {
-        let total = self.process_rows().len() as isize;
-        if total == 0 {
-            self.selected = 0;
+        let rows = self.process_rows();
+        if rows.is_empty() {
+            self.selected = None;
             return;
         }
-        let next = self.selected as isize + step;
-        self.selected = next.clamp(0, total - 1) as usize;
+        let current = match self.selected_row_index() {
+            Some(i) => i as isize,
+            None if step < 0 => rows.len() as isize,
+            None => -1,
+        };
+        let next = (current + step).clamp(0, rows.len() as isize - 1) as usize;
+        self.selected = Some((rows[next].0, rows[next].1.pid));
     }
 
     pub(crate) fn select_up(&mut self, _: &SelectUp, _: &mut gpui::Window, cx: &mut Context<Self>) {
@@ -281,8 +346,9 @@ impl GpuMonitor {
 
     /// The process the kill action targets: the selected row in display order.
     fn kill_target(&self) -> Option<(u32, String)> {
+        let index = self.selected_row_index()?;
         self.process_rows()
-            .get(self.selected)
+            .get(index)
             .map(|(_, p)| (p.pid, p.name.clone()))
     }
 
@@ -354,7 +420,7 @@ pub(crate) fn run(nvml: Nvml, watch_ms: u64) -> Result<()> {
                         rx,
                         snapshots: Vec::new(),
                         history: Vec::new(),
-                        selected: 0,
+                        selected: None,
                         sort_key: SortKey::Memory,
                         sort_asc: false,
                         last_message: None,
@@ -434,7 +500,7 @@ mod tests {
                 },
             ],
             history: Vec::new(),
-            selected: 0,
+            selected: None,
             sort_key: SortKey::Memory,
             sort_asc: false,
             last_message: None,
@@ -443,11 +509,14 @@ mod tests {
         let pids: Vec<u32> = rows.iter().map(|(_, p)| p.pid).collect();
         assert_eq!(pids, vec![2, 3, 1]); // 900, 500, 100
         assert_eq!(rows[0].0, 0); // gpu index of pid 2
-        view.clamp_selection();
-        assert_eq!(view.selected, 0);
-        view.selected = 99;
-        view.clamp_selection();
-        assert_eq!(view.selected, 2);
+        // A selection whose process is still listed survives revalidation.
+        view.selected = Some((0, 2));
+        view.revalidate_selection();
+        assert_eq!(view.selected, Some((0, 2)));
+        // A selection whose process is gone is dropped.
+        view.selected = Some((0, 99));
+        view.revalidate_selection();
+        assert_eq!(view.selected, None);
     }
 
     #[test]
@@ -477,7 +546,7 @@ mod tests {
                 graphics_bytes: 0,
             }],
             history: Vec::new(),
-            selected: 0,
+            selected: None,
             sort_key: SortKey::Memory,
             sort_asc: false,
             last_message: None,
@@ -544,7 +613,7 @@ mod tests {
                 graphics_bytes: 0,
             }],
             history: Vec::new(),
-            selected: 0,
+            selected: None,
             sort_key: SortKey::Pid,
             sort_asc: true,
             last_message: None,
@@ -577,26 +646,58 @@ mod tests {
     #[test]
     fn test_step_selection_clamps() {
         let mut view = view_with_pids(&[1, 2, 3]);
+        // From no selection, down enters at the first row.
         view.step_selection(1);
-        assert_eq!(view.selected, 1);
+        assert_eq!(view.selected, Some((0, 1)));
+        view.step_selection(1);
+        assert_eq!(view.selected, Some((0, 2)));
         view.step_selection(10);
-        assert_eq!(view.selected, 2);
+        assert_eq!(view.selected, Some((0, 3)));
         view.step_selection(-10);
-        assert_eq!(view.selected, 0);
+        assert_eq!(view.selected, Some((0, 1)));
+        // From no selection, up enters at the last row.
+        view.selected = None;
         view.step_selection(-1);
-        assert_eq!(view.selected, 0);
+        assert_eq!(view.selected, Some((0, 3)));
+        // Empty list: nothing to select.
+        let mut empty = view_with_pids(&[]);
+        empty.step_selection(1);
+        assert_eq!(empty.selected, None);
     }
 
     #[test]
     fn test_kill_target_follows_selection() {
         let mut view = view_with_pids(&[11, 22, 33]);
+        view.selected = Some((0, 11));
         assert_eq!(view.kill_target().unwrap().0, 11);
-        view.selected = 2;
+        view.selected = Some((0, 33));
         let (pid, name) = view.kill_target().unwrap();
         assert_eq!(pid, 33);
         assert_eq!(name, "p33");
-        // Empty list: no target, kill is a no-op.
+        // Empty list or a dead selection: no target, kill is a no-op.
         assert!(view_with_pids(&[]).kill_target().is_none());
+        view.selected = Some((0, 44));
+        assert!(view.kill_target().is_none());
+    }
+
+    /// The final-review finding: selection must follow the process across
+    /// re-sorts, not the display row it happened to occupy — otherwise `x`
+    /// can kill whatever moved into that row between polls.
+    #[test]
+    fn test_selection_follows_process_across_resort() {
+        let mut view = view_with_pids(&[11, 22, 33]);
+        view.sort_key = SortKey::Memory;
+        view.sort_asc = false;
+        view.snapshots[0].processes[0].used_gpu_memory = 300;
+        view.snapshots[0].processes[1].used_gpu_memory = 200;
+        view.snapshots[0].processes[2].used_gpu_memory = 100;
+        view.selected = Some((0, 33)); // last row under memory-desc
+        assert_eq!(view.selected_row_index(), Some(2));
+        // pid 33's memory grows past the others: it moves to row 0, and the
+        // pid-keyed selection moves with it.
+        view.snapshots[0].processes[2].used_gpu_memory = 999;
+        assert_eq!(view.selected_row_index(), Some(0));
+        assert_eq!(view.kill_target().unwrap().0, 33);
     }
 
     #[test]
@@ -607,5 +708,114 @@ mod tests {
         let (msg, ok) = kill_message(Err::<(), _>(std::io::Error::other("denied")), 7, "ollama");
         assert!(!ok);
         assert_eq!(msg, "kill 7 failed: denied");
+    }
+
+    // --- final review: snapshot degrade seam ---
+
+    struct FakeSource {
+        name: Option<String>,
+        temperature: Option<u32>,
+        utilization: Option<u32>,
+        memory: Option<(u64, u64)>,
+        power_usage: Option<u32>,
+        power_limit: Option<u32>,
+        clock: Option<u32>,
+        compute: Option<Vec<ProcessInfo>>,
+        graphics: Option<Vec<ProcessInfo>>,
+    }
+
+    impl DeviceSource for FakeSource {
+        fn name(&self) -> Option<String> {
+            self.name.clone()
+        }
+
+        fn temperature(&self) -> Option<u32> {
+            self.temperature
+        }
+
+        fn utilization(&self) -> Option<u32> {
+            self.utilization
+        }
+
+        fn memory(&self) -> Option<(u64, u64)> {
+            self.memory
+        }
+
+        fn power_usage(&self) -> Option<u32> {
+            self.power_usage
+        }
+
+        fn power_limit(&self) -> Option<u32> {
+            self.power_limit
+        }
+
+        fn clock(&self) -> Option<u32> {
+            self.clock
+        }
+
+        fn running_compute_processes(&self) -> Option<Vec<ProcessInfo>> {
+            self.compute.clone()
+        }
+
+        fn running_graphics_processes(&self) -> Option<Vec<ProcessInfo>> {
+            self.graphics.clone()
+        }
+    }
+
+    fn no_vram(_: &[u32]) -> std::collections::HashMap<u32, u64> {
+        std::collections::HashMap::new()
+    }
+
+    /// Every failed read degrades to its neutral value while the process
+    /// list still assembles — pins the poll-loop degrade invariant without
+    /// hardware.
+    #[test]
+    fn test_snapshot_for_degrades_per_field_on_errors() {
+        let pid = std::process::id();
+        let src = FakeSource {
+            name: None,
+            temperature: None,
+            utilization: None,
+            memory: None,
+            power_usage: None,
+            power_limit: None,
+            clock: None,
+            compute: Some(vec![proc_info(pid, 1234)]),
+            graphics: None,
+        };
+        let snap = snapshot_for(&src, 0, &no_vram);
+        assert_eq!(snap.name, "GPU");
+        assert_eq!(snap.temperature, 0);
+        assert_eq!(snap.utilization, 0);
+        assert_eq!((snap.memory_used, snap.memory_total), (0, 0));
+        assert_eq!((snap.power_usage, snap.power_limit), (0, 0));
+        assert_eq!(snap.clock_freq, 0);
+        assert_eq!(snap.processes.len(), 1);
+        assert_eq!(snap.processes[0].used_gpu_memory, 1234);
+    }
+
+    #[test]
+    fn test_snapshot_for_reads_flow_through() {
+        let src = FakeSource {
+            name: Some("RTX".into()),
+            temperature: Some(61),
+            utilization: Some(42),
+            memory: Some((2_000_000_000, 8_000_000_000)),
+            power_usage: Some(120_000),
+            power_limit: Some(250_000),
+            clock: Some(1800),
+            compute: None,
+            graphics: None,
+        };
+        let snap = snapshot_for(&src, 1, &no_vram);
+        assert_eq!(snap.name, "RTX");
+        assert_eq!(snap.temperature, 61);
+        assert_eq!(snap.utilization, 42);
+        assert_eq!(snap.memory_used, 2_000_000_000);
+        assert_eq!(snap.memory_total, 8_000_000_000);
+        assert_eq!(snap.power_usage, 120); // mW → W
+        assert_eq!(snap.power_limit, 250);
+        assert_eq!(snap.clock_freq, 1800);
+        assert_eq!(snap.index, 1);
     }
 }

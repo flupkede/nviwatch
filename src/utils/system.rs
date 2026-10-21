@@ -103,12 +103,10 @@ mod imp {
     /// only populated when the refresh kind asks for it — without this the
     /// name and username columns stay empty. `OnlyIfNotSet` matches
     /// `ProcessRefreshKind::everything()`'s convention: fetched once per
-    /// process lifetime rather than re-read every tick. CPU and memory feed
-    /// nothing here; disk usage and exe are not read anywhere.
+    /// process lifetime rather than re-read every tick. CPU, memory, disk
+    /// and exe are not read here.
     fn process_refresh_kind() -> ProcessRefreshKind {
         ProcessRefreshKind::nothing()
-            .with_cpu()
-            .with_memory()
             .with_cmd(UpdateKind::OnlyIfNotSet)
             .with_user(UpdateKind::OnlyIfNotSet)
     }
