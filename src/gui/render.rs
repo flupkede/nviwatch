@@ -1,10 +1,14 @@
 //! Rendering for the gpui GPU monitor window.
 
-use gpui::{Context, Render, Rgba, Window, div, prelude::*, px, rgb};
+use gpui::{
+    Context, Div, PathBuilder, Pixels, Render, Rgba, Stateful, Window, canvas, div, point,
+    prelude::*, px, rgb,
+};
 
 use super::GpuMonitor;
-use super::data::ProcKind;
+use super::data::{MemSample, ProcKind, SortKey};
 use super::format_memory;
+use super::graph::{area_geometry, stacked_geometry};
 
 const BG: u32 = 0x0e1116;
 const CARD: u32 = 0x161b22;
@@ -16,6 +20,10 @@ const LLM: u32 = 0xff9f43;
 /// Graphics/video segment and tag color.
 const VIDEO: u32 = 0x4fc3f7;
 const SELECT_BG: u32 = 0x2d3b4e;
+/// Unaccounted VRAM (driver, desktop) in the memory graph.
+const OTHER: u32 = 0x3a4150;
+const UTIL: u32 = 0xc792ea;
+const POWER: u32 = 0xe5c07b;
 
 fn kind_label(kind: ProcKind) -> &'static str {
     match kind {
@@ -59,11 +67,22 @@ impl Render for GpuMonitor {
         }
 
         for gpu in &self.snapshots {
-            root = root.child(render_gpu_card(gpu));
+            let samples: Vec<MemSample> = self
+                .history
+                .get(gpu.index)
+                .map(|ring| ring.iter().copied().collect())
+                .unwrap_or_default();
+            root = root.child(render_gpu_card(gpu, &samples));
         }
 
         let rows = self.process_rows();
-        root = root.child(render_process_list(&rows, self.selected));
+        root = root.child(render_process_list(
+            cx,
+            &rows,
+            self.selected,
+            self.sort_key,
+            self.sort_asc,
+        ));
 
         root = root.child(
             div()
@@ -77,7 +96,7 @@ impl Render for GpuMonitor {
     }
 }
 
-fn render_gpu_card(gpu: &super::GpuSnapshot) -> impl IntoElement {
+fn render_gpu_card(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -103,20 +122,201 @@ fn render_gpu_card(gpu: &super::GpuSnapshot) -> impl IntoElement {
                     gpu.temperature, gpu.utilization, gpu.power_usage, gpu.power_limit, gpu.clock_freq,
                 ))),
         )
+        .child(render_memory_graph(gpu, samples))
+        .child(render_small_graphs(gpu, samples))
+}
+
+/// Stacked VRAM graph: video (bottom), LLM, other — with a current-value
+/// label, scale and legend.
+fn render_memory_graph(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl IntoElement {
+    let samples = samples.to_vec();
+    let y_max_label = samples
+        .iter()
+        .map(|s| s.mem_total.max(s.compute + s.graphics + s.other))
+        .max()
+        .unwrap_or(0);
+    div()
+        .flex()
+        .flex_col()
+        .gap_0p5()
         .child(
             div()
+                .flex()
+                .justify_between()
                 .text_color(rgb(TEXT))
                 .child(format!(
-                    "VRAM {}/{}   LLM {}   video {}",
+                    "{}/{}",
                     format_memory(gpu.memory_used),
-                    format_memory(gpu.memory_total),
-                    format_memory(gpu.compute_bytes),
-                    format_memory(gpu.graphics_bytes),
+                    format_memory(gpu.memory_total)
                 )),
+        )
+        .child(
+            div()
+                .h(px(150.))
+                .w_full()
+                .child(canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        paint_stacked(bounds, &samples, window);
+                    },
+                )
+                .size_full()),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .text_xs()
+                .text_color(rgb(DIM))
+                .child("0")
+                .child(format_memory(y_max_label)),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_3()
+                .text_xs()
+                .text_color(rgb(DIM))
+                .child(legend_swatch(rgb(VIDEO), "video / processen"))
+                .child(legend_swatch(rgb(LLM), "LLM (ollama)"))
+                .child(legend_swatch(rgb(OTHER), "overig")),
         )
 }
 
-fn render_process_list(rows: &[(usize, &super::GpuProc)], selected: usize) -> impl IntoElement {
+fn legend_swatch(color: Rgba, label: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(div().size_2().rounded_sm().bg(color))
+        .child(label)
+}
+
+fn paint_stacked(bounds: gpui::Bounds<gpui::Pixels>, samples: &[MemSample], window: &mut Window) {
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    let Some(geo) = stacked_geometry(samples, width, height) else {
+        return;
+    };
+    let origin = bounds.origin;
+    let to_point = |(x, y): (f32, f32)| point(origin.x + px(x), origin.y + px(y));
+    let mut paint_layer = |vertices: &[(f32, f32)], color: Rgba| {
+        let points: Vec<_> = vertices.iter().copied().map(to_point).collect();
+        let mut builder = PathBuilder::fill();
+        builder.add_polygon(&points, true);
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, color);
+        }
+    };
+    paint_layer(&geo.graphics, rgb(VIDEO));
+    paint_layer(&geo.compute, rgb(LLM));
+    paint_layer(&geo.other, rgb(OTHER));
+}
+
+/// Utilization and power side by side under the memory graph. The power
+/// scale is the enforced power limit — a stable ceiling, unlike a
+/// history-derived max that jumps as soon as the card idles.
+fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl IntoElement {
+    let util: Vec<f32> = samples.iter().map(|s| s.util as f32).collect();
+    let power: Vec<f32> = samples.iter().map(|s| s.power as f32).collect();
+    let power_max = if gpu.power_limit > 0 {
+        gpu.power_limit as f32
+    } else {
+        power.iter().copied().fold(0.0_f32, f32::max).max(1.0)
+    };
+    let power_label = if gpu.power_limit > 0 {
+        format!("{}/{}W", gpu.power_usage, gpu.power_limit)
+    } else {
+        format!("{}W", gpu.power_usage)
+    };
+    div()
+        .flex()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .gap_0p5()
+                .child(
+                    div()
+                        .text_color(rgb(TEXT))
+                        .child(format!("{}%", gpu.utilization)),
+                )
+                .child(
+                    div()
+                        .h(px(56.))
+                        .w_full()
+                        .child(canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                paint_area(bounds, &util, 100.0, rgb(UTIL), window);
+                            },
+                        )
+                        .size_full()),
+                )
+                .child(div().text_xs().text_color(rgb(DIM)).child("utilization")),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .gap_0p5()
+                .child(div().text_color(rgb(TEXT)).child(power_label))
+                .child(
+                    div()
+                        .h(px(56.))
+                        .w_full()
+                        .child(canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                paint_area(bounds, &power, power_max, rgb(POWER), window);
+                            },
+                        )
+                        .size_full()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(DIM))
+                        .child(format!("power (scale {power_max:.0}W)")),
+                ),
+        )
+}
+
+fn paint_area(
+    bounds: gpui::Bounds<gpui::Pixels>,
+    values: &[f32],
+    v_max: f32,
+    color: Rgba,
+    window: &mut Window,
+) {
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    let Some(vertices) = area_geometry(values, v_max, width, height) else {
+        return;
+    };
+    let origin = bounds.origin;
+    let points: Vec<_> = vertices
+        .iter()
+        .copied()
+        .map(|(x, y)| point(origin.x + px(x), origin.y + px(y)))
+        .collect();
+    let mut builder = PathBuilder::fill();
+    builder.add_polygon(&points, true);
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+fn render_process_list(
+    cx: &mut Context<GpuMonitor>,
+    rows: &[(usize, &super::GpuProc)],
+    selected: usize,
+    sort_key: SortKey,
+    sort_asc: bool,
+) -> impl IntoElement {
     let mut list = div()
         .id("process-list")
         .flex()
@@ -148,11 +348,15 @@ fn render_process_list(rows: &[(usize, &super::GpuProc)], selected: usize) -> im
             .border_b_1()
             .border_color(rgb(BORDER))
             .pb_1()
-            .child(div().w(px(70.)).child("PID"))
-            .child(div().w(px(80.)).child("GPU-Mem"))
-            .child(div().w(px(64.)).child("Type"))
-            .child(div().w(px(180.)).child("Name"))
-            .child(div().child("User")),
+            .child(sort_header(cx, "hdr-pid", "PID", SortKey::Pid, sort_key, sort_asc, Some(px(70.))))
+            .child(sort_header(
+                cx, "hdr-mem", "GPU-Mem", SortKey::Memory, sort_key, sort_asc, Some(px(80.)),
+            ))
+            .child(sort_header(cx, "hdr-kind", "Type", SortKey::Kind, sort_key, sort_asc, Some(px(64.))))
+            .child(sort_header(
+                cx, "hdr-name", "Name", SortKey::Name, sort_key, sort_asc, Some(px(180.)),
+            ))
+            .child(sort_header(cx, "hdr-user", "User", SortKey::User, sort_key, sort_asc, None)),
     );
 
     for (index, (gpu_index, process)) in rows.iter().enumerate() {
@@ -183,4 +387,29 @@ fn render_process_list(rows: &[(usize, &super::GpuProc)], selected: usize) -> im
         list = list.child(row);
     }
     list
+}
+
+/// Clickable column header; the active column shows its sort direction.
+fn sort_header(
+    cx: &mut Context<GpuMonitor>,
+    id: &'static str,
+    label: &'static str,
+    key: SortKey,
+    active: SortKey,
+    asc: bool,
+    width: Option<Pixels>,
+) -> Stateful<Div> {
+    let arrow = if active == key {
+        if asc { " ▲" } else { " ▼" }
+    } else {
+        ""
+    };
+    let mut cell = div()
+        .id(id)
+        .on_click(cx.listener(move |view, _, _, _| view.toggle_sort(key)))
+        .cursor_pointer();
+    if let Some(w) = width {
+        cell = cell.w(w);
+    }
+    cell.child(format!("{label}{arrow}"))
 }

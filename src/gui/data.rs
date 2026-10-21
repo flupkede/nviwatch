@@ -5,10 +5,7 @@
 
 use std::collections::VecDeque;
 
-use nvml::enums::device::UsedGpuMemory;
-use nvml::struct_wrappers::device::ProcessInfo;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) enum ProcKind {
     /// CUDA/compute — ollama and other LLM runtimes.
     Compute,
@@ -26,37 +23,36 @@ pub(crate) struct GpuProc {
     pub user: String,
 }
 
-/// Pure NVML→rows classification. A pid in both lists keeps the larger memory
-/// figure; Compute wins the tie (the LLM case this app exists for).
-pub(crate) fn classify_processes(
-    compute: &[ProcessInfo],
-    graphics: &[ProcessInfo],
-) -> Vec<(u32, u64, ProcKind)> {
-    let mut rows: Vec<(u32, u64, ProcKind)> = Vec::new();
-    let push = |pid: u32, bytes: u64, kind: ProcKind, rows: &mut Vec<(u32, u64, ProcKind)>| {
-        if let Some(existing) = rows.iter_mut().find(|(p, _, _)| *p == pid) {
-            if bytes > existing.1 {
-                existing.1 = bytes;
-                existing.2 = kind;
-            }
-        } else {
-            rows.push((pid, bytes, kind));
-        }
-    };
-    for p in compute {
-        push(p.pid, used_bytes(&p.used_gpu_memory), ProcKind::Compute, &mut rows);
+/// Process-name fragments that indicate an LLM runtime. Separators are
+/// stripped from the name before matching, so "LM Studio" hits `lmstudio`.
+const LLM_NAME_HINTS: &[&str] = &[
+    "ollama", "llama", "vllm", "lmstudio", "kobold", "exllama", "gpt4all", "tabby", "comfyui",
+    "sglang", "msty",
+];
+
+/// Name-based classification. NVML's compute/graphics lists cannot decide
+/// this on WDDM — both contain every GPU process — so the display name does.
+pub(crate) fn classify_by_name(name: &str) -> ProcKind {
+    let normalized: String = name
+        .to_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '_' | '.'))
+        .collect();
+    if LLM_NAME_HINTS.iter().any(|hint| normalized.contains(hint)) {
+        ProcKind::Compute
+    } else {
+        ProcKind::Graphics
     }
-    for p in graphics {
-        push(p.pid, used_bytes(&p.used_gpu_memory), ProcKind::Graphics, &mut rows);
-    }
-    rows
 }
 
-fn used_bytes(memory: &UsedGpuMemory) -> u64 {
-    match memory {
-        UsedGpuMemory::Used(bytes) => *bytes,
-        UsedGpuMemory::Unavailable => 0,
-    }
+/// Column the process list is sorted by (clickable headers).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SortKey {
+    Pid,
+    Memory,
+    Kind,
+    Name,
+    User,
 }
 
 /// One history point for the memory graph (stage 3 renders it).
@@ -105,48 +101,22 @@ pub(crate) fn push_samples(history: &mut Vec<VecDeque<MemSample>>, snapshots: &[
 mod tests {
     use super::*;
 
-    fn proc(pid: u32, bytes: u64) -> ProcessInfo {
-        ProcessInfo {
-            pid,
-            used_gpu_memory: UsedGpuMemory::Used(bytes),
-            compute_instance_id: None,
-            gpu_instance_id: None,
-        }
+    #[test]
+    fn test_classify_by_name_llm_hints() {
+        assert_eq!(classify_by_name("ollama"), ProcKind::Compute);
+        assert_eq!(classify_by_name("Ollama.exe"), ProcKind::Compute);
+        assert_eq!(classify_by_name("llama-server"), ProcKind::Compute);
+        assert_eq!(classify_by_name("LM Studio.exe"), ProcKind::Compute);
+        assert_eq!(classify_by_name("vllm serve"), ProcKind::Compute);
     }
 
     #[test]
-    fn test_classify_separate_lists() {
-        let rows = classify_processes(&[proc(1, 100)], &[proc(2, 200)]);
-        assert_eq!(
-            rows,
-            vec![
-                (1, 100, ProcKind::Compute),
-                (2, 200, ProcKind::Graphics),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_classify_overlap_keeps_larger_compute_wins_tie() {
-        // Same pid in both lists: larger figure wins; equal → Compute.
-        let rows = classify_processes(&[proc(7, 300)], &[proc(7, 200)]);
-        assert_eq!(rows, vec![(7, 300, ProcKind::Compute)]);
-        let rows = classify_processes(&[proc(7, 100)], &[proc(7, 500)]);
-        assert_eq!(rows, vec![(7, 500, ProcKind::Graphics)]);
-        let rows = classify_processes(&[proc(7, 100)], &[proc(7, 100)]);
-        assert_eq!(rows, vec![(7, 100, ProcKind::Compute)]);
-    }
-
-    #[test]
-    fn test_classify_unavailable_memory_is_zero() {
-        let unavailable = ProcessInfo {
-            pid: 9,
-            used_gpu_memory: UsedGpuMemory::Unavailable,
-            compute_instance_id: None,
-            gpu_instance_id: None,
-        };
-        let rows = classify_processes(&[unavailable], &[]);
-        assert_eq!(rows, vec![(9, 0, ProcKind::Compute)]);
+    fn test_classify_by_name_defaults_graphics() {
+        assert_eq!(classify_by_name("chrome.exe"), ProcKind::Graphics);
+        assert_eq!(classify_by_name("explorer.EXE"), ProcKind::Graphics);
+        assert_eq!(classify_by_name(""), ProcKind::Graphics);
+        // Substring must not fire inside unrelated words.
+        assert_eq!(classify_by_name("collimator"), ProcKind::Graphics);
     }
 
     #[test]

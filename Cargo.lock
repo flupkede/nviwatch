@@ -4138,6 +4138,7 @@ dependencies = [
  "sysinfo 0.39.6",
  "textwrap",
  "tokio",
+ "windows 0.62.2",
 ]
 
 [[package]]

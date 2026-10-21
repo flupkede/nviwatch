@@ -5,7 +5,9 @@
 //! driver call can never stall a frame.
 
 mod data;
+mod graph;
 mod render;
+mod vram;
 
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
@@ -18,7 +20,7 @@ use nvml::Nvml;
 
 use crate::Result;
 use crate::utils::system::get_process_identity;
-use data::{GpuProc, MemSample, push_samples};
+use data::{GpuProc, MemSample, ProcKind, SortKey, push_samples};
 
 actions!(nviwatch, [Quit]);
 
@@ -41,19 +43,41 @@ pub(crate) struct GpuSnapshot {
     pub graphics_bytes: u64,
 }
 
-/// Merge compute+graphics NVML lists into typed rows, then resolve
-/// name/user per platform. Dead processes drop silently.
+/// Merge the NVML process lists into typed rows: name/user resolved per
+/// platform, kind decided by name, VRAM from D3DKMT with the NVML figure as
+/// fallback (D3DKMT is Windows-only; NVML reports "NA" there on WDDM). Dead
+/// processes drop silently.
 fn enrich(
     compute: Vec<nvml::struct_wrappers::device::ProcessInfo>,
     graphics: Vec<nvml::struct_wrappers::device::ProcessInfo>,
 ) -> Vec<GpuProc> {
-    data::classify_processes(&compute, &graphics)
-        .into_iter()
-        .filter_map(|(pid, used_gpu_memory, kind)| {
-            get_process_identity(pid).map(|(name, user)| GpuProc {
+    let mut pids: Vec<u32> = Vec::new();
+    let mut nvml_mem: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for info in compute.iter().chain(graphics.iter()) {
+        let bytes = match info.used_gpu_memory {
+            nvml::enums::device::UsedGpuMemory::Used(bytes) => bytes,
+            nvml::enums::device::UsedGpuMemory::Unavailable => 0,
+        };
+        nvml_mem
+            .entry(info.pid)
+            .and_modify(|existing| *existing = (*existing).max(bytes))
+            .or_insert(bytes);
+        if !pids.contains(&info.pid) {
+            pids.push(info.pid);
+        }
+    }
+    let vram = vram::process_vram_bytes(&pids);
+    pids.into_iter()
+        .filter_map(|pid| {
+            let (name, user) = get_process_identity(pid)?;
+            Some(GpuProc {
                 pid,
-                used_gpu_memory,
-                kind,
+                used_gpu_memory: vram
+                    .get(&pid)
+                    .copied()
+                    .or_else(|| nvml_mem.get(&pid).copied())
+                    .unwrap_or(0),
+                kind: data::classify_by_name(&name),
                 name,
                 user,
             })
@@ -85,21 +109,17 @@ fn poll_loop(nvml: Nvml, watch_ms: u64, tx: std::sync::mpsc::Sender<Vec<GpuSnaps
                     .unwrap_or(0);
                 let compute = device.running_compute_processes().unwrap_or_default();
                 let graphics = device.running_graphics_processes().unwrap_or_default();
-                let compute_bytes = compute
-                    .iter()
-                    .filter_map(|p| match p.used_gpu_memory {
-                        nvml::enums::device::UsedGpuMemory::Used(b) => Some(b),
-                        _ => None,
-                    })
-                    .sum();
-                let graphics_bytes = graphics
-                    .iter()
-                    .filter_map(|p| match p.used_gpu_memory {
-                        nvml::enums::device::UsedGpuMemory::Used(b) => Some(b),
-                        _ => None,
-                    })
-                    .sum();
                 let processes = enrich(compute, graphics);
+                let compute_bytes = processes
+                    .iter()
+                    .filter(|p| p.kind == ProcKind::Compute)
+                    .map(|p| p.used_gpu_memory)
+                    .sum();
+                let graphics_bytes = processes
+                    .iter()
+                    .filter(|p| p.kind == ProcKind::Graphics)
+                    .map(|p| p.used_gpu_memory)
+                    .sum();
                 snapshots.push(GpuSnapshot {
                     index: index as usize,
                     name,
@@ -129,8 +149,11 @@ pub(crate) struct GpuMonitor {
     pub(crate) snapshots: Vec<GpuSnapshot>,
     /// Per-GPU-index ring of memory samples for the stage-3 graph.
     pub(crate) history: Vec<std::collections::VecDeque<MemSample>>,
-    /// Row index into the flattened, memory-sorted process list.
+    /// Row index into the flattened, sorted process list.
     pub(crate) selected: usize,
+    /// Current column sort of the process list (clickable headers).
+    pub(crate) sort_key: SortKey,
+    pub(crate) sort_asc: bool,
 }
 
 impl GpuMonitor {
@@ -164,16 +187,37 @@ impl GpuMonitor {
         .detach();
     }
 
-    /// Flattened process rows across GPUs, GPU-memory descending — the display
-    /// order for the list, selection and (stage 4) kill targeting.
+    /// Flattened process rows across GPUs in the current column sort — the
+    /// display order for the list, selection and (stage 4) kill targeting.
     pub(crate) fn process_rows(&self) -> Vec<(usize, &GpuProc)> {
         let mut rows: Vec<(usize, &GpuProc)> = self
             .snapshots
             .iter()
             .flat_map(|gpu| gpu.processes.iter().map(move |p| (gpu.index, p)))
             .collect();
-        rows.sort_by_key(|(_, p)| std::cmp::Reverse(p.used_gpu_memory));
+        let (key, asc) = (self.sort_key, self.sort_asc);
+        rows.sort_by(|a, b| {
+            let ord = match key {
+                SortKey::Pid => a.1.pid.cmp(&b.1.pid),
+                SortKey::Memory => a.1.used_gpu_memory.cmp(&b.1.used_gpu_memory),
+                SortKey::Kind => a.1.kind.cmp(&b.1.kind),
+                SortKey::Name => a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()),
+                SortKey::User => a.1.user.cmp(&b.1.user),
+            };
+            if asc { ord } else { ord.reverse() }
+        });
         rows
+    }
+
+    /// Header click: same column flips direction, a new column starts in its
+    /// natural direction (memory reads best largest-first).
+    pub(crate) fn toggle_sort(&mut self, key: SortKey) {
+        if self.sort_key == key {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort_key = key;
+            self.sort_asc = !matches!(key, SortKey::Memory);
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -220,6 +264,8 @@ pub(crate) fn run(nvml: Nvml, watch_ms: u64) -> Result<()> {
                         snapshots: Vec::new(),
                         history: Vec::new(),
                         selected: 0,
+                        sort_key: SortKey::Memory,
+                        sort_asc: false,
                     };
                     view.start_drain(cx);
                     view
@@ -294,6 +340,8 @@ mod tests {
             ],
             history: Vec::new(),
             selected: 0,
+            sort_key: SortKey::Memory,
+            sort_asc: false,
         };
         let rows = view.process_rows();
         let pids: Vec<u32> = rows.iter().map(|(_, p)| p.pid).collect();
@@ -304,5 +352,59 @@ mod tests {
         view.selected = 99;
         view.clamp_selection();
         assert_eq!(view.selected, 2);
+    }
+
+    #[test]
+    fn test_toggle_sort_and_name_order() {
+        use data::GpuProc;
+        let mk = |pid: u32, name: &str| GpuProc {
+            pid,
+            used_gpu_memory: 0,
+            kind: ProcKind::Graphics,
+            name: name.into(),
+            user: "u".into(),
+        };
+        let mut view = GpuMonitor {
+            rx: channel::<Vec<GpuSnapshot>>().1,
+            snapshots: vec![GpuSnapshot {
+                index: 0,
+                name: "G".into(),
+                temperature: 0,
+                utilization: 0,
+                memory_used: 0,
+                memory_total: 0,
+                power_usage: 0,
+                power_limit: 0,
+                clock_freq: 0,
+                processes: vec![mk(1, "zeta"), mk(2, "Alpha"), mk(3, "mid")],
+                compute_bytes: 0,
+                graphics_bytes: 0,
+            }],
+            history: Vec::new(),
+            selected: 0,
+            sort_key: SortKey::Memory,
+            sort_asc: false,
+        };
+        // New column starts ascending (memory is the descending exception).
+        view.toggle_sort(SortKey::Name);
+        assert!(view.sort_asc);
+        let names: Vec<&str> = view
+            .process_rows()
+            .iter()
+            .map(|(_, p)| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Alpha", "mid", "zeta"]);
+        // Same column flips to descending.
+        view.toggle_sort(SortKey::Name);
+        assert!(!view.sort_asc);
+        let names: Vec<&str> = view
+            .process_rows()
+            .iter()
+            .map(|(_, p)| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["zeta", "mid", "Alpha"]);
+        // Switching to memory starts descending.
+        view.toggle_sort(SortKey::Memory);
+        assert!(!view.sort_asc);
     }
 }

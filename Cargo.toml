@@ -29,6 +29,12 @@ tokio = { version = "1.53.1", features = ["full"] }
 nix = { version = "0.31.3", features = ["process", "signal", "user"] }
 procfs = "0.18.0"
 
-# Windows-only: cross-platform system probe backing the process/CPU backend.
+# Windows-only: cross-platform system probe backing the process/CPU backend,
+# plus D3DKMT for per-process VRAM (NVML reports "NA" there on WDDM).
 [target.'cfg(windows)'.dependencies]
 sysinfo = "0.39"
+windows = { version = "0.62", features = [
+    "Wdk_Graphics_Direct3D",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
