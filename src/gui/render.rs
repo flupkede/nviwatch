@@ -8,7 +8,7 @@ use gpui::{
 use super::GpuMonitor;
 use super::data::{MemSample, ProcKind, SortKey};
 use super::format_memory;
-use super::graph::{area_geometry, stacked_geometry};
+use super::graph::{area_geometry, grid_label, grid_labels, grid_ticks, stacked_geometry};
 
 const BG: u32 = 0x0e1116;
 const CARD: u32 = 0x161b22;
@@ -90,19 +90,24 @@ impl Render for GpuMonitor {
             self.sort_asc,
         ));
 
-        let mut footer = div()
-            .flex()
-            .justify_between()
-            .text_color(rgb(DIM))
-            .child("up/down select · x kill · q quit");
-        if let Some((message, ok)) = &self.last_message {
-            footer = footer.child(
-                div()
-                    .text_color(rgb(if *ok { OK } else { ERR }))
-                    .child(message.clone()),
-            );
+        let mut footer = div().flex().justify_between().text_color(rgb(DIM));
+        match &self.last_message {
+            Some((message, ok)) => {
+                footer = footer
+                    .child(
+                        div()
+                            .text_color(rgb(if *ok { OK } else { ERR }))
+                            .child(message.clone()),
+                    )
+                    .child(format!("{} processes", rows.len()));
+            }
+            None => {
+                footer = footer
+                    .child(div())
+                    .child(format!("{} processes", rows.len()));
+            }
         }
-        root = root.child(footer.child(format!("{} processes", rows.len())));
+        root = root.child(footer);
         root
     }
 }
@@ -120,6 +125,7 @@ fn render_gpu_card(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl Into
         .child(
             div()
                 .flex()
+                .flex_wrap()
                 .items_baseline()
                 .gap_3()
                 .child(
@@ -135,15 +141,22 @@ fn render_gpu_card(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl Into
                     gpu.power_usage,
                     gpu.power_limit,
                     gpu.clock_freq,
+                )))
+                .child(div().flex_1())
+                .child(div().text_color(rgb(TEXT)).child(format!(
+                    "{}/{}",
+                    format_memory(gpu.memory_used),
+                    format_memory(gpu.memory_total)
                 ))),
         )
-        .child(render_memory_graph(gpu, samples))
+        .child(render_memory_graph(samples))
         .child(render_small_graphs(gpu, samples))
 }
 
-/// Stacked VRAM graph: video (bottom), LLM, other — with a current-value
-/// label, scale and legend.
-fn render_memory_graph(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl IntoElement {
+/// Stacked VRAM graph: video (bottom), LLM, other — with 500MiB gridlines,
+/// GiB axis labels and a legend. The used/total figure lives in the card
+/// header, not here.
+fn render_memory_graph(samples: &[MemSample]) -> impl IntoElement {
     let samples = samples.to_vec();
     // Same y-scale rule as graph.rs stacked_geometry — keep the two in sync
     // or the axis label stops matching the drawn polygons.
@@ -152,6 +165,23 @@ fn render_memory_graph(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
         .map(|s| s.mem_total.max(s.compute + s.graphics + s.other))
         .max()
         .unwrap_or(0);
+    // Axis labels in a column to the RIGHT of the bar: the y_max figure
+    // carries the unit at the very top, 0 sits at the bottom, bare numbers
+    // pin to their gridlines in between.
+    let mut tick_labels: Vec<_> = if y_max_label > 0 {
+        grid_labels(y_max_label)
+            .into_iter()
+            .filter(|&v| v != y_max_label)
+            .chain(std::iter::once(0))
+            .map(|v| {
+                let y = 150.0 - (v as f32 / y_max_label as f32) * 150.0;
+                axis_label((y - 7.0).max(0.0), grid_label(v))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    tick_labels.push(axis_label(0.0, format_memory(y_max_label)));
     div()
         .flex()
         .flex_col()
@@ -159,33 +189,25 @@ fn render_memory_graph(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
         .child(
             div()
                 .flex()
-                .justify_between()
-                .text_color(rgb(TEXT))
-                .child(format!(
-                    "{}/{}",
-                    format_memory(gpu.memory_used),
-                    format_memory(gpu.memory_total)
-                )),
-        )
-        .child(
-            div().h(px(150.)).w_full().child(
-                canvas(
-                    |_, _, _| {},
-                    move |bounds, _, window, _| {
-                        paint_stacked(bounds, &samples, window);
-                    },
+                .gap_1()
+                .child(
+                    div().h(px(150.)).flex_1().relative().child(
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, _| {
+                                paint_stacked(bounds, &samples, window);
+                            },
+                        )
+                        .size_full(),
+                    ),
                 )
-                .size_full(),
-            ),
-        )
-        .child(
-            div()
-                .flex()
-                .justify_between()
-                .text_xs()
-                .text_color(rgb(DIM))
-                .child("0")
-                .child(format_memory(y_max_label)),
+                .child(
+                    div()
+                        .h(px(150.))
+                        .w(px(48.))
+                        .relative()
+                        .children(tick_labels),
+                ),
         )
         .child(
             div()
@@ -208,6 +230,15 @@ fn legend_swatch(color: Rgba, label: &'static str) -> impl IntoElement {
         .child(label)
 }
 
+fn axis_label(top: f32, text: impl IntoElement) -> Div {
+    div()
+        .absolute()
+        .top(px(top))
+        .text_xs()
+        .text_color(rgb(DIM))
+        .child(text)
+}
+
 fn paint_stacked(bounds: gpui::Bounds<gpui::Pixels>, samples: &[MemSample], window: &mut Window) {
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
@@ -227,6 +258,14 @@ fn paint_stacked(bounds: gpui::Bounds<gpui::Pixels>, samples: &[MemSample], wind
     paint_layer(&geo.graphics, rgb(VIDEO));
     paint_layer(&geo.compute, rgb(LLM));
     paint_layer(&geo.other, rgb(OTHER));
+    // Horizontal gridlines every 500 MiB, 1px, over the bands.
+    for v in grid_ticks(geo.y_max) {
+        let y = height - (v as f32 / geo.y_max as f32) * height;
+        paint_layer(
+            &[(0.0, y), (width, y), (width, y + 1.0), (0.0, y + 1.0)],
+            rgb(BORDER),
+        );
+    }
 }
 
 /// Utilization and power side by side under the memory graph. The power
@@ -400,12 +439,12 @@ fn render_process_list(
             ))
             .child(sort_header(
                 cx,
-                "hdr-user",
-                "User",
-                SortKey::User,
+                "hdr-util",
+                "GPU%",
+                SortKey::Util,
                 sort_key,
                 sort_asc,
-                None,
+                Some(px(56.)),
             )),
     );
 
@@ -414,6 +453,10 @@ fn render_process_list(
             "—".to_string()
         } else {
             format_memory(process.used_gpu_memory)
+        };
+        let util = match process.sm_util {
+            Some(u) => format!("{u}%"),
+            None => "—".to_string(),
         };
         // Selection is keyed by (gpu, pid), not row: the row a process
         // occupies can change between polls.
@@ -443,11 +486,7 @@ fn render_process_list(
                     .text_ellipsis()
                     .child(process.name.clone()),
             )
-            .child(
-                div()
-                    .text_color(rgb(DIM))
-                    .child(format!("gpu{gpu_index} · {}", process.user)),
-            );
+            .child(div().w(px(56.)).child(util));
         list = list.child(row);
     }
     list

@@ -112,6 +112,41 @@ pub(crate) fn area_geometry(
     Some(polygon)
 }
 
+/// Gridline spacing on the memory graph: 500 MiB steps.
+pub(crate) const GRID_STEP: u64 = 500 * 1_048_576;
+const GIB: u64 = 1_048_576 * 1024;
+
+/// Gridline values below `y_max` (the top edge itself carries no line).
+pub(crate) fn grid_ticks(y_max: u64) -> Vec<u64> {
+    (1..)
+        .map(|k| k * GRID_STEP)
+        .take_while(|&v| v < y_max)
+        .collect()
+}
+
+/// Labeled gridline values: GiB multiples up to and including `y_max`,
+/// thinned so at most ~8 labels sit on the axis without overlapping.
+pub(crate) fn grid_labels(y_max: u64) -> Vec<u64> {
+    if y_max < GIB {
+        return Vec::new();
+    }
+    let step = (y_max / GIB).div_ceil(8).max(1) * GIB;
+    (1..)
+        .map(|k| k * step)
+        .take_while(|&v| v <= y_max)
+        .collect()
+}
+
+/// Compact axis label for a gridline value: GiB multiples are bare numbers
+/// (the unit lives in the y_max label at the top), sub-GiB steps carry theirs.
+pub(crate) fn grid_label(bytes: u64) -> String {
+    if bytes.is_multiple_of(GIB) {
+        format!("{}", bytes / GIB)
+    } else {
+        format!("{}M", bytes / 1_048_576)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +221,52 @@ mod tests {
         assert_eq!(poly[1], (100.0, 0.0));
         assert_eq!(poly[2], (100.0, 50.0));
         assert_eq!(poly[3], (0.0, 50.0));
+    }
+
+    #[test]
+    fn test_grid_ticks_step_500mib() {
+        let gib = 1_048_576u64 * 1024;
+        // 6 GiB / 500 MiB = 12.3 → twelve full steps fit below the top edge.
+        let ticks = grid_ticks(6 * gib);
+        assert_eq!(ticks.len(), 12);
+        assert_eq!(ticks[0], GRID_STEP);
+        assert_eq!(*ticks.last().unwrap(), 12 * GRID_STEP);
+        assert!(grid_ticks(0).is_empty());
+    }
+
+    #[test]
+    fn test_grid_labels_gib_multiples_thinned() {
+        let gib = 1_048_576u64 * 1024;
+        // Up to and including y_max — the top of the bar is labeled too.
+        assert_eq!(
+            grid_labels(6 * gib),
+            vec![gib, 2 * gib, 3 * gib, 4 * gib, 5 * gib, 6 * gib]
+        );
+        // Below one GiB there is no room for a labeled gridline.
+        assert!(grid_labels(gib / 2).is_empty());
+        // 24 GiB thins to 3-GiB steps so the labels stay readable.
+        assert_eq!(
+            grid_labels(24 * gib),
+            (1..=8).map(|k| 3 * k * gib).collect::<Vec<_>>()
+        );
+        // 9-13 GiB must thin too (12 GiB → 2-GiB steps, 6 labels) or the
+        // axis overflows with overlapping text.
+        assert_eq!(
+            grid_labels(12 * gib),
+            (1..=6).map(|k| 2 * k * gib).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            grid_labels(13 * gib),
+            (1..=6).map(|k| 2 * k * gib).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_grid_label_format() {
+        let gib = 1_048_576u64 * 1024;
+        // GiB multiples render as bare numbers; the unit lives in the y_max label.
+        assert_eq!(grid_label(gib), "1");
+        assert_eq!(grid_label(GRID_STEP), "500M");
+        assert_eq!(grid_label(gib / 2), "512M");
     }
 }

@@ -13,14 +13,15 @@ pub(crate) enum ProcKind {
     Graphics,
 }
 
-/// One GPU process row after classification; name/user resolved per platform.
+/// One GPU process row after classification; name resolved per platform.
 #[derive(Clone, Debug)]
 pub(crate) struct GpuProc {
     pub pid: u32,
     pub used_gpu_memory: u64,
     pub kind: ProcKind,
     pub name: String,
-    pub user: String,
+    /// NVML SM (3D/compute) utilization for this pid, when reported.
+    pub sm_util: Option<u32>,
 }
 
 /// Process-name fragments that indicate an LLM runtime. Separators are
@@ -52,7 +53,7 @@ pub(crate) enum SortKey {
     Memory,
     Kind,
     Name,
-    User,
+    Util,
 }
 
 /// One history point for the memory graph (stage 3 renders it).

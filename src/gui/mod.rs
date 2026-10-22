@@ -19,10 +19,10 @@ use gpui::{
 use nvml::Nvml;
 use nvml::device::Device;
 use nvml::enum_wrappers::device::{Clock, TemperatureSensor};
-use nvml::struct_wrappers::device::ProcessInfo;
+use nvml::struct_wrappers::device::{ProcessInfo, ProcessUtilizationSample};
 
 use crate::Result;
-use crate::utils::system::get_process_identity;
+use crate::utils::system::get_process_name;
 use data::{GpuProc, MemSample, ProcKind, SortKey, push_samples};
 
 actions!(nviwatch, [Quit, SelectUp, SelectDown, KillSelected]);
@@ -46,13 +46,14 @@ pub(crate) struct GpuSnapshot {
     pub graphics_bytes: u64,
 }
 
-/// Merge the NVML process lists into typed rows: name/user resolved per
+/// Merge the NVML process lists into typed rows: name resolved per
 /// platform, kind decided by name, VRAM from D3DKMT with the NVML figure as
-/// fallback (D3DKMT is Windows-only; NVML reports "NA" there on WDDM). Dead
-/// processes drop silently. `vram` is injected so the fallback chain is
-/// testable without hardware.
+/// fallback (D3DKMT is Windows-only; NVML reports "NA" there on WDDM) and
+/// SM utilization keyed by pid. Dead processes drop silently. `vram` and
+/// `utils` are injected so the chains are testable without hardware.
 fn enrich_with(
     vram: &std::collections::HashMap<u32, u64>,
+    utils: &std::collections::HashMap<u32, u32>,
     compute: Vec<ProcessInfo>,
     graphics: Vec<ProcessInfo>,
 ) -> Vec<GpuProc> {
@@ -70,7 +71,7 @@ fn enrich_with(
     union_pids(&compute, &graphics)
         .into_iter()
         .filter_map(|pid| {
-            let (name, user) = get_process_identity(pid)?;
+            let name = get_process_name(pid)?;
             Some(GpuProc {
                 pid,
                 used_gpu_memory: vram
@@ -80,7 +81,7 @@ fn enrich_with(
                     .unwrap_or(0),
                 kind: data::classify_by_name(&name),
                 name,
-                user,
+                sm_util: utils.get(&pid).copied(),
             })
         })
         .collect()
@@ -110,6 +111,9 @@ trait DeviceSource {
     fn clock(&self) -> Option<u32>;
     fn running_compute_processes(&self) -> Option<Vec<ProcessInfo>>;
     fn running_graphics_processes(&self) -> Option<Vec<ProcessInfo>>;
+    /// Per-pid SM utilization samples (empty on platforms/drivers that do
+    /// not report them).
+    fn process_utils(&self) -> Option<Vec<ProcessUtilizationSample>>;
 }
 
 impl DeviceSource for Device<'_> {
@@ -148,6 +152,10 @@ impl DeviceSource for Device<'_> {
     fn running_graphics_processes(&self) -> Option<Vec<ProcessInfo>> {
         self.running_graphics_processes().ok()
     }
+
+    fn process_utils(&self) -> Option<Vec<ProcessUtilizationSample>> {
+        self.process_utilization_stats(None).ok()
+    }
 }
 
 /// Assemble one GPU's snapshot, degrading every failed read to its neutral
@@ -167,7 +175,13 @@ fn snapshot_for(
     let compute = src.running_compute_processes().unwrap_or_default();
     let graphics = src.running_graphics_processes().unwrap_or_default();
     let pids = union_pids(&compute, &graphics);
-    let processes = enrich_with(&vram_fn(&pids), compute, graphics);
+    let utils: std::collections::HashMap<u32, u32> = src
+        .process_utils()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s.pid, s.sm_util))
+        .collect();
+    let processes = enrich_with(&vram_fn(&pids), &utils, compute, graphics);
     let compute_bytes = processes
         .iter()
         .filter(|p| p.kind == ProcKind::Compute)
@@ -279,7 +293,7 @@ impl GpuMonitor {
                 SortKey::Memory => a.1.used_gpu_memory.cmp(&b.1.used_gpu_memory),
                 SortKey::Kind => a.1.kind.cmp(&b.1.kind),
                 SortKey::Name => a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()),
-                SortKey::User => a.1.user.cmp(&b.1.user),
+                SortKey::Util => a.1.sm_util.unwrap_or(0).cmp(&b.1.sm_util.unwrap_or(0)),
             };
             if asc { ord } else { ord.reverse() }
         });
@@ -287,13 +301,13 @@ impl GpuMonitor {
     }
 
     /// Header click: same column flips direction, a new column starts in its
-    /// natural direction (memory reads best largest-first).
+    /// natural direction (memory and utilization read best largest-first).
     pub(crate) fn toggle_sort(&mut self, key: SortKey) {
         if self.sort_key == key {
             self.sort_asc = !self.sort_asc;
         } else {
             self.sort_key = key;
-            self.sort_asc = !matches!(key, SortKey::Memory);
+            self.sort_asc = !matches!(key, SortKey::Memory | SortKey::Util);
         }
     }
 
@@ -462,7 +476,7 @@ mod tests {
             used_gpu_memory: mem,
             kind,
             name: "x".into(),
-            user: "u".into(),
+            sm_util: None,
         };
         let mut view = GpuMonitor {
             rx: channel::<Vec<GpuSnapshot>>().1,
@@ -527,7 +541,7 @@ mod tests {
             used_gpu_memory: 0,
             kind: ProcKind::Graphics,
             name: name.into(),
-            user: "u".into(),
+            sm_util: None,
         };
         let mut view = GpuMonitor {
             rx: channel::<Vec<GpuSnapshot>>().1,
@@ -572,6 +586,9 @@ mod tests {
         // Switching to memory starts descending.
         view.toggle_sort(SortKey::Memory);
         assert!(!view.sort_asc);
+        // Utilization also reads best largest-first.
+        view.toggle_sort(SortKey::Util);
+        assert!(!view.sort_asc);
     }
 
     // --- stage 4: enrich seam, selection, kill target ---
@@ -593,7 +610,7 @@ mod tests {
                 used_gpu_memory: 0,
                 kind: ProcKind::Graphics,
                 name: format!("p{pid}"),
-                user: "u".into(),
+                sm_util: None,
             })
             .collect();
         GpuMonitor {
@@ -627,20 +644,24 @@ mod tests {
         let pid = std::process::id();
         let rows = enrich_with(
             &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
             vec![proc_info(pid, 1234)],
             Vec::new(),
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pid, pid);
         assert_eq!(rows[0].used_gpu_memory, 1234);
+        assert_eq!(rows[0].sm_util, None);
     }
 
     #[test]
     fn test_enrich_with_vram_map_wins_over_nvml() {
         let pid = std::process::id();
         let vram = std::collections::HashMap::from([(pid, 9999u64)]);
-        let rows = enrich_with(&vram, vec![proc_info(pid, 1234)], Vec::new());
+        let utils = std::collections::HashMap::from([(pid, 77u32)]);
+        let rows = enrich_with(&vram, &utils, vec![proc_info(pid, 1234)], Vec::new());
         assert_eq!(rows[0].used_gpu_memory, 9999);
+        assert_eq!(rows[0].sm_util, Some(77));
     }
 
     #[test]
@@ -722,6 +743,7 @@ mod tests {
         clock: Option<u32>,
         compute: Option<Vec<ProcessInfo>>,
         graphics: Option<Vec<ProcessInfo>>,
+        utils: Option<Vec<ProcessUtilizationSample>>,
     }
 
     impl DeviceSource for FakeSource {
@@ -760,10 +782,25 @@ mod tests {
         fn running_graphics_processes(&self) -> Option<Vec<ProcessInfo>> {
             self.graphics.clone()
         }
+
+        fn process_utils(&self) -> Option<Vec<ProcessUtilizationSample>> {
+            self.utils.clone()
+        }
     }
 
     fn no_vram(_: &[u32]) -> std::collections::HashMap<u32, u64> {
         std::collections::HashMap::new()
+    }
+
+    fn util_sample(pid: u32, sm_util: u32) -> ProcessUtilizationSample {
+        ProcessUtilizationSample {
+            pid,
+            timestamp: 0,
+            sm_util,
+            mem_util: 0,
+            enc_util: 0,
+            dec_util: 0,
+        }
     }
 
     /// Every failed read degrades to its neutral value while the process
@@ -782,6 +819,7 @@ mod tests {
             clock: None,
             compute: Some(vec![proc_info(pid, 1234)]),
             graphics: None,
+            utils: None,
         };
         let snap = snapshot_for(&src, 0, &no_vram);
         assert_eq!(snap.name, "GPU");
@@ -806,6 +844,7 @@ mod tests {
             clock: Some(1800),
             compute: None,
             graphics: None,
+            utils: None,
         };
         let snap = snapshot_for(&src, 1, &no_vram);
         assert_eq!(snap.name, "RTX");
@@ -817,5 +856,34 @@ mod tests {
         assert_eq!(snap.power_limit, 250);
         assert_eq!(snap.clock_freq, 1800);
         assert_eq!(snap.index, 1);
+    }
+
+    /// NVML's per-pid utilization samples land on the matching row; pids
+    /// without a sample degrade to `None`.
+    #[test]
+    fn test_snapshot_for_maps_util_to_pids() {
+        let pid = std::process::id();
+        let src = FakeSource {
+            name: None,
+            temperature: None,
+            utilization: None,
+            memory: None,
+            power_usage: None,
+            power_limit: None,
+            clock: None,
+            compute: Some(vec![proc_info(pid, 10)]),
+            graphics: None,
+            utils: Some(vec![util_sample(pid, 77)]),
+        };
+        let snap = snapshot_for(&src, 0, &no_vram);
+        assert_eq!(snap.processes.len(), 1);
+        assert_eq!(snap.processes[0].sm_util, Some(77));
+        // A process absent from the samples has no utilization figure.
+        let empty = FakeSource {
+            utils: Some(vec![util_sample(999_999, 5)]),
+            ..src
+        };
+        let snap = snapshot_for(&empty, 0, &no_vram);
+        assert_eq!(snap.processes[0].sm_util, None);
     }
 }
