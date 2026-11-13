@@ -308,7 +308,7 @@ fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
                         .child(format!("{}%", gpu.utilization)),
                 )
                 .child(
-                    div().h(px(72.)).w_full().child(
+                    div().h(px(88.)).w_full().child(
                         canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
@@ -328,7 +328,7 @@ fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
                 .gap_0p5()
                 .child(div().text_color(rgb(TEXT)).child(power_label))
                 .child(
-                    div().h(px(72.)).w_full().child(
+                    div().h(px(88.)).w_full().child(
                         canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
