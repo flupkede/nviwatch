@@ -250,6 +250,9 @@ pub(crate) struct GpuMonitor {
     pub(crate) sort_asc: bool,
     /// Last kill outcome for the footer: (text, ok).
     pub(crate) last_message: Option<(String, bool)>,
+    /// Scroll state of the process list — paints the scrollbar thumb and
+    /// keeps the keyboard selection in view.
+    pub(crate) list_scroll: gpui::ScrollHandle,
 }
 
 impl GpuMonitor {
@@ -346,6 +349,8 @@ impl GpuMonitor {
         };
         let next = (current + step).clamp(0, rows.len() as isize - 1) as usize;
         self.selected = Some((rows[next].0, rows[next].1.pid));
+        // +1: the tracked div's child 0 is the column header, rows follow.
+        self.list_scroll.scroll_to_item(next + 1);
     }
 
     pub(crate) fn select_up(&mut self, _: &SelectUp, _: &mut gpui::Window, cx: &mut Context<Self>) {
@@ -443,6 +448,7 @@ pub(crate) fn run(nvml: Nvml, watch_ms: u64) -> Result<()> {
                         sort_key: SortKey::Memory,
                         sort_asc: false,
                         last_message: None,
+                        list_scroll: gpui::ScrollHandle::new(),
                     };
                     view.start_drain(cx);
                     view
@@ -523,6 +529,7 @@ mod tests {
             sort_key: SortKey::Memory,
             sort_asc: false,
             last_message: None,
+            list_scroll: gpui::ScrollHandle::new(),
         };
         let rows = view.process_rows();
         let pids: Vec<u32> = rows.iter().map(|(_, p)| p.pid).collect();
@@ -569,6 +576,7 @@ mod tests {
             sort_key: SortKey::Memory,
             sort_asc: false,
             last_message: None,
+            list_scroll: gpui::ScrollHandle::new(),
         };
         // New column starts ascending (memory is the descending exception).
         view.toggle_sort(SortKey::Name);
@@ -639,6 +647,7 @@ mod tests {
             sort_key: SortKey::Pid,
             sort_asc: true,
             last_message: None,
+            list_scroll: gpui::ScrollHandle::new(),
         }
     }
 

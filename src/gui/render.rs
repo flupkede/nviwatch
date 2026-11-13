@@ -84,6 +84,7 @@ impl Render for GpuMonitor {
         let rows = self.process_rows();
         root = root.child(render_process_list(
             cx,
+            &self.list_scroll,
             &rows,
             self.selected_row_index(),
             self.sort_key,
@@ -217,7 +218,7 @@ fn render_memory_graph(samples: &[MemSample]) -> impl IntoElement {
                 .text_color(rgb(DIM))
                 .child(legend_swatch(rgb(VIDEO), "video / processen"))
                 .child(legend_swatch(rgb(LLM), "LLM (ollama)"))
-                .child(legend_swatch(rgb(OTHER), "overig")),
+                .child(legend_swatch(rgb(OTHER), "other")),
         )
 }
 
@@ -377,32 +378,33 @@ fn paint_area(
 
 fn render_process_list(
     cx: &mut Context<GpuMonitor>,
+    scroll: &gpui::ScrollHandle,
     rows: &[(usize, &super::GpuProc)],
     selected: Option<usize>,
     sort_key: SortKey,
     sort_asc: bool,
 ) -> impl IntoElement {
+    let outer = div().flex().flex_col().flex_1().min_h_0().relative();
     let mut list = div()
         .id("process-list")
         .flex()
         .flex_col()
-        .flex_1()
-        .min_h_0()
+        .size_full()
         .bg(rgb(CARD))
         .border_1()
         .border_color(rgb(BORDER))
         .rounded_md()
         .p_2()
-        .overflow_y_scroll();
+        .overflow_y_scroll()
+        .track_scroll(scroll);
 
     if rows.is_empty() {
         list = list
-            .flex_1()
             .items_center()
             .justify_center()
             .text_color(rgb(DIM))
             .child("No GPU processes");
-        return list;
+        return outer.child(list);
     }
 
     list = list.child(
@@ -501,7 +503,39 @@ fn render_process_list(
             .child(div().w(px(56.)).child(util));
         list = list.child(row);
     }
-    list
+    outer.child(list).child(scrollbar_thumb(scroll))
+}
+
+/// Right-edge thumb overlay for the process list — decorative (the wheel and
+/// the keyboard do the scrolling), but it makes the scroll extent visible.
+fn scrollbar_thumb(scroll: &gpui::ScrollHandle) -> impl IntoElement {
+    let scroll = scroll.clone();
+    canvas(
+        move |_, _, _| {},
+        move |bounds, _, window, _| {
+            let viewport = f32::from(bounds.size.height);
+            let max = f32::from(scroll.max_offset().height);
+            if viewport <= 0.0 || max <= 1.0 {
+                return;
+            }
+            let content = viewport + max;
+            let thumb_len = (viewport * viewport / content).clamp(24.0, viewport);
+            let y = f32::from(scroll.offset().y) / max * (viewport - thumb_len);
+            let thumb = gpui::Bounds {
+                origin: point(
+                    bounds.origin.x + px(f32::from(bounds.size.width) - 6.0),
+                    bounds.origin.y + px(y),
+                ),
+                size: gpui::size(px(4.0), px(thumb_len)),
+            };
+            window.paint_quad(gpui::fill(thumb, rgb(DIM)));
+        },
+    )
+    .absolute()
+    .top_0()
+    .bottom_0()
+    .right_0()
+    .w(px(8.))
 }
 
 /// Clickable column header; the active column shows its sort direction.
