@@ -187,11 +187,16 @@ fn snapshot_for(
         .filter(|p| p.kind == ProcKind::Compute)
         .map(|p| p.used_gpu_memory)
         .sum();
-    let graphics_bytes = processes
+    let graphics_bytes: u64 = processes
         .iter()
         .filter(|p| p.kind == ProcKind::Graphics)
         .map(|p| p.used_gpu_memory)
         .sum();
+    // Per-process GPU counters can over-report on hybrid graphics (dwm's
+    // cross-adapter composition surfaces are booked as dedicated VRAM), so
+    // the graphics band never claims more than the card really uses. The
+    // compute band stays exact — CUDA allocations are real.
+    let graphics_bytes = graphics_bytes.min(memory_used.saturating_sub(compute_bytes));
     GpuSnapshot {
         index,
         name,
@@ -790,6 +795,31 @@ mod tests {
 
     fn no_vram(_: &[u32]) -> std::collections::HashMap<u32, u64> {
         std::collections::HashMap::new()
+    }
+
+    /// Per-process graphics counters can exceed the card's real usage (dwm
+    /// over-reports on hybrid graphics), so the graphics band is clamped to
+    /// what NVML says the card holds — which stays exact.
+    #[test]
+    fn test_snapshot_for_clamps_graphics_band_to_used() {
+        let pid = std::process::id();
+        let src = FakeSource {
+            name: Some("RTX".into()),
+            temperature: Some(0),
+            utilization: Some(0),
+            memory: Some((1_000_000_000, 6_000_000_000)),
+            power_usage: Some(0),
+            power_limit: Some(0),
+            clock: Some(0),
+            compute: None,
+            graphics: Some(vec![proc_info(pid, 0)]),
+            utils: None,
+        };
+        let fat_vram = |pids: &[u32]| pids.iter().map(|&p| (p, 2_000_000_000)).collect();
+        let snap = snapshot_for(&src, 0, &fat_vram);
+        // The counter claims 2 GB but the card only holds 1 GB.
+        assert_eq!(snap.compute_bytes, 0);
+        assert_eq!(snap.graphics_bytes, 1_000_000_000);
     }
 
     fn util_sample(pid: u32, sm_util: u32) -> ProcessUtilizationSample {

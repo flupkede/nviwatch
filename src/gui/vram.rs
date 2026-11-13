@@ -1,14 +1,17 @@
-//! Per-process VRAM on Windows via D3DKMT — the source Task Manager uses.
+//! Per-process VRAM on Windows — D3DKMT first, PDH fallback.
 //!
 //! NVML cannot report per-process memory on WDDM (every process reads "NA"),
 //! so the figure comes from `D3DKMTQueryStatistics` with the
 //! PROCESS_SEGMENT_GROUP type: the LOCAL segment group is dedicated VRAM.
 //! The query rejects a `PROCESS_QUERY_LIMITED_INFORMATION` handle with
 //! STATUS_INVALID_PARAMETER, so the process is opened with full query rights.
-//! The NVIDIA adapter is identified by DXGI description match — a process
-//! also commits memory on the iGPU, and those figures must not leak in.
-//! Each pid is queried against every NVIDIA adapter and the largest figure
-//! wins. Non-Windows builds return an empty map; NVML already fills
+//! Processes that refuse even that handle (elevated services like ollama's
+//! llama-server deny every handle) fall back to the GPU performance counters
+//! ("\GPU Process Memory(pid_*)\Dedicated Usage"), which need no process
+//! handle at all. The NVIDIA adapter is identified by DXGI description match —
+//! a process also commits memory on the iGPU, and those figures must not
+//! leak in. Each pid is queried against every NVIDIA adapter and the largest
+//! figure wins. Non-Windows builds return an empty map; NVML already fills
 //! `used_gpu_memory` there.
 
 #[cfg(windows)]
@@ -35,31 +38,170 @@ pub(crate) fn process_vram_bytes(pids: &[u32]) -> std::collections::HashMap<u32,
     }
 
     for &pid in pids {
-        let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) }) else {
-            continue;
-        };
         let mut best: u64 = 0;
-        for luid in &luids {
-            let query = D3DKMT_QUERYSTATISTICS {
-                Type: D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP,
-                AdapterLuid: *luid,
-                hProcess: handle,
-                Anonymous: D3DKMT_QUERYSTATISTICS_0 {
-                    QueryProcessSegmentGroup: D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL,
-                },
-                ..Default::default()
-            };
-            if succeeded(unsafe { D3DKMTQueryStatistics(&query) }) {
-                let usage = unsafe { query.QueryResult.ProcessSegmentGroupInformation.Usage };
-                best = best.max(usage);
+        if let Ok(handle) = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) } {
+            for luid in &luids {
+                let query = D3DKMT_QUERYSTATISTICS {
+                    Type: D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT_GROUP,
+                    AdapterLuid: *luid,
+                    hProcess: handle,
+                    Anonymous: D3DKMT_QUERYSTATISTICS_0 {
+                        QueryProcessSegmentGroup: D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL,
+                    },
+                    ..Default::default()
+                };
+                if succeeded(unsafe { D3DKMTQueryStatistics(&query) }) {
+                    let usage = unsafe { query.QueryResult.ProcessSegmentGroupInformation.Usage };
+                    best = best.max(usage);
+                }
             }
-        }
-        unsafe {
-            let _ = CloseHandle(handle);
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
         }
         map.insert(pid, best);
     }
+
+    // Elevated processes deny every handle, so their D3DKMT figure is 0; the
+    // PDH counters cover them without needing a handle at all.
+    for (pid, bytes) in pdh_dedicated_bytes(pids, &luids) {
+        map.entry(pid)
+            .and_modify(|v| *v = (*v).max(bytes))
+            .or_insert(bytes);
+    }
     map
+}
+
+/// Dedicated VRAM per pid from the GPU performance counters — the same source
+/// Task Manager uses. Any failure degrades to an empty map; the NVML figure
+/// then fills in as before.
+#[cfg(windows)]
+fn pdh_dedicated_bytes(pids: &[u32], luids: &[LUID]) -> std::collections::HashMap<u32, u64> {
+    use windows::Win32::System::Performance::{
+        PDH_FMT_COUNTERVALUE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA,
+        PERF_DETAIL_WIZARD, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
+        PdhEnumObjectItemsW, PdhGetFormattedCounterValue, PdhOpenQueryW,
+    };
+    use windows::core::{HSTRING, PWSTR, w};
+
+    let wanted: std::collections::HashSet<u32> = pids.iter().copied().collect();
+    // Instances carry the adapter LUID ("pid_<n>_luid_0x..._0x..._phys_<n>");
+    // matching ours keeps iGPU bytes out.
+    let luid_hints: Vec<String> = luids
+        .iter()
+        .map(|l| format!("0x{:08x}_0x{:08x}", l.HighPart as u32, l.LowPart).to_ascii_lowercase())
+        .collect();
+
+    let mut query = PDH_HQUERY::default();
+    if unsafe { PdhOpenQueryW(None, 0, &mut query) } != 0 {
+        return std::collections::HashMap::new();
+    }
+    let mut result = std::collections::HashMap::new();
+
+    // Instance names for the "GPU Process Memory" counter set; sizes are in
+    // UTF-16 units and grow with the process count, hence the retry. Both
+    // lists need real buffers — with a NULL counter list the call answers
+    // PDH_MORE_DATA forever.
+    let mut c_need = 512u32;
+    let mut i_need = 4096u32;
+    let mut status: u32;
+    let instance_buf = loop {
+        let mut counter_buf = vec![0u16; c_need as usize];
+        let mut buf = vec![0u16; i_need as usize];
+        let mut c_size = c_need;
+        let mut size = i_need;
+        status = unsafe {
+            PdhEnumObjectItemsW(
+                None,
+                None,
+                w!("GPU Process Memory"),
+                Some(PWSTR(counter_buf.as_mut_ptr())),
+                &mut c_size,
+                Some(PWSTR(buf.as_mut_ptr())),
+                &mut size,
+                PERF_DETAIL_WIZARD,
+                0,
+            )
+        };
+        if status == 0 || status != PDH_MORE_DATA {
+            break buf;
+        }
+        let (grew_c, grew_i) = (c_size > c_need, size > i_need);
+        c_need = c_need.max(c_size);
+        i_need = i_need.max(size);
+        if !grew_c && !grew_i {
+            break Vec::new();
+        }
+    };
+
+    if status == 0 && !instance_buf.is_empty() {
+        let mut targets: Vec<(u32, bool, HSTRING)> = Vec::new();
+        let mut start = 0usize;
+        for i in 0..instance_buf.len() {
+            if instance_buf[i] != 0 {
+                continue;
+            }
+            if i > start {
+                let name = String::from_utf16_lossy(&instance_buf[start..i]);
+                if let Some(pid) = name
+                    .strip_prefix("pid_")
+                    .and_then(|r| r.split('_').next())
+                    .and_then(|s| s.parse().ok())
+                    .filter(|pid| wanted.contains(pid))
+                {
+                    let exact = luid_hints
+                        .iter()
+                        .any(|hint| name.to_ascii_lowercase().contains(hint));
+                    targets.push((
+                        pid,
+                        exact,
+                        HSTRING::from(format!("\\GPU Process Memory({name})\\Dedicated Usage")),
+                    ));
+                }
+            }
+            start = i + 1;
+            // Double null terminates the multi-sz list.
+            if start < instance_buf.len() && instance_buf[start] == 0 {
+                break;
+            }
+        }
+
+        let mut counters: Vec<(u32, bool, PDH_HCOUNTER)> = Vec::new();
+        for (pid, exact, path) in &targets {
+            let mut counter = PDH_HCOUNTER::default();
+            if unsafe { PdhAddEnglishCounterW(query, path, 0, &mut counter) } == 0 {
+                counters.push((*pid, *exact, counter));
+            }
+        }
+
+        if unsafe { PdhCollectQueryData(query) } == 0 {
+            let mut on_gpu: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+            let mut elsewhere = std::collections::HashMap::new();
+            for (pid, exact, counter) in &counters {
+                let mut value = PDH_FMT_COUNTERVALUE::default();
+                if unsafe { PdhGetFormattedCounterValue(*counter, PDH_FMT_LARGE, None, &mut value) }
+                    == 0
+                {
+                    let bytes = unsafe { value.Anonymous.largeValue }.max(0) as u64;
+                    let map = if *exact { &mut on_gpu } else { &mut elsewhere };
+                    map.entry(*pid)
+                        .and_modify(|b| *b = (*b).max(bytes))
+                        .or_insert(bytes);
+                }
+            }
+            for (pid, bytes) in on_gpu {
+                result.insert(pid, bytes);
+            }
+            for (pid, bytes) in elsewhere {
+                result.entry(pid).or_insert(bytes);
+            }
+        }
+    }
+
+    unsafe {
+        let _ = PdhCloseQuery(query);
+    }
+    result
 }
 
 /// NVIDIA adapter LUIDs via DXGI description match; falls back to every
