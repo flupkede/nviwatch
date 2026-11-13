@@ -268,17 +268,25 @@ fn paint_stacked(bounds: gpui::Bounds<gpui::Pixels>, samples: &[MemSample], wind
     }
 }
 
-/// Utilization and power side by side under the memory graph. The power
-/// scale is the enforced power limit — a stable ceiling, unlike a
-/// history-derived max that jumps as soon as the card idles.
+/// Utilization and power side by side under the memory graph, both plotted
+/// as a percentage of a stable ceiling — utilization of 100%, power of the
+/// enforced power limit — so the axis never jumps as usage swings.
 fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl IntoElement {
     let util: Vec<f32> = samples.iter().map(|s| s.util as f32).collect();
-    let power: Vec<f32> = samples.iter().map(|s| s.power as f32).collect();
     let power_max = if gpu.power_limit > 0 {
         gpu.power_limit as f32
     } else {
-        power.iter().copied().fold(0.0_f32, f32::max).max(1.0)
+        // No limit reported: fall back to the window peak, still shown as %.
+        samples
+            .iter()
+            .map(|s| s.power as f32)
+            .fold(0.0_f32, f32::max)
+            .max(1.0)
     };
+    let power_pct: Vec<f32> = samples
+        .iter()
+        .map(|s| s.power as f32 / power_max * 100.0)
+        .collect();
     let power_label = if gpu.power_limit > 0 {
         format!("{}/{}W", gpu.power_usage, gpu.power_limit)
     } else {
@@ -299,7 +307,7 @@ fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
                         .child(format!("{}%", gpu.utilization)),
                 )
                 .child(
-                    div().h(px(56.)).w_full().child(
+                    div().h(px(72.)).w_full().child(
                         canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
@@ -309,7 +317,7 @@ fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
                         .size_full(),
                     ),
                 )
-                .child(div().text_xs().text_color(rgb(DIM)).child("utilization")),
+                .child(div().text_xs().text_color(rgb(DIM)).child("utilization %")),
         )
         .child(
             div()
@@ -319,11 +327,11 @@ fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
                 .gap_0p5()
                 .child(div().text_color(rgb(TEXT)).child(power_label))
                 .child(
-                    div().h(px(56.)).w_full().child(
+                    div().h(px(72.)).w_full().child(
                         canvas(
                             |_, _, _| {},
                             move |bounds, _, window, _| {
-                                paint_area(bounds, &power, power_max, rgb(POWER), window);
+                                paint_area(bounds, &power_pct, 100.0, rgb(POWER), window);
                             },
                         )
                         .size_full(),
@@ -333,7 +341,11 @@ fn render_small_graphs(gpu: &super::GpuSnapshot, samples: &[MemSample]) -> impl 
                     div()
                         .text_xs()
                         .text_color(rgb(DIM))
-                        .child(format!("power (scale {power_max:.0}W)")),
+                        .child(if gpu.power_limit > 0 {
+                            format!("power % of {}W", gpu.power_limit)
+                        } else {
+                            "power % of peak".to_string()
+                        }),
                 ),
         )
 }
